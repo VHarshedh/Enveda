@@ -1,0 +1,57 @@
+{
+  "stage": "eda",
+  "config": {
+    "seed": 42,
+    "SMOKE_TEST": false,
+    "smoke_n_rows": 500,
+    "time_budget_s": 3600,
+    "n_cpu_workers": 4,
+    "mp_chunk_size": 250,
+    "use_gpu_acceleration": true,
+    "data_dir": "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra",
+    "output_dir": "/kaggle/working/artifacts/eda",
+    "ppm_tolerance": 10.0,
+    "mass_match_ppm": 5.0,
+    "top_k_peaks": 200,
+    "truncate_array_len": 8
+  },
+  "library_versions": {
+    "python": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "rdkit": "2026.03.6",
+    "scipy": "1.18.1",
+    "torch": "2.14.1+cpu"
+  },
+  "hardware": {
+    "n_cpus": 12,
+    "n_gpus": 0,
+    "devices": [
+      "No GPU detected (CPU mode)"
+    ]
+  },
+  "files": [
+    "schema.json",
+    "train_clean.parquet",
+    "test_clean.parquet",
+    "stats.json",
+    "manifest.json",
+    "recommendations.md",
+    "figures/01_precursor_mz.png",
+    "figures/02_peaks_per_spectrum.png",
+    "figures/03_adduct_polarity.png",
+    "figures/04_mol_properties.png",
+    "figures/05_ppm_error.png",
+    "figures/06_example_spectra.png"
+  ],
+  "metrics": {
+    "train_rows": 100,
+    "test_rows": 100,
+    "train_molecules": 100,
+    "test_molecules": 33,
+    "rdkit_parse_rate": 1.0,
+    "mass_sanity_match_rate": 0.98,
+    "test_mass_overlap_rate": 0.0
+  },
+  "timestamp": "2026-10-02T01:56:08.973967"
+}

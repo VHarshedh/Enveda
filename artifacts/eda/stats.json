@@ -1,0 +1,210 @@
+{
+  "train_spectral": {
+    "name": "train",
+    "n_rows": 100,
+    "n_unique_molecules": 100,
+    "spectra_per_molecule": {
+      "mean": 1.0,
+      "median": 1.0,
+      "min": 1,
+      "max": 1
+    },
+    "peaks_per_spectrum": {
+      "mean": 130.93,
+      "median": 167.0,
+      "min": 6,
+      "max": 200,
+      "q95": 200.0,
+      "q99": 200.0
+    },
+    "precursor_mz": {
+      "min": 73.0284,
+      "max": 1101.4281,
+      "mean": 365.621485,
+      "median": 321.1663
+    },
+    "adduct_counts": {
+      "[M+H]+": 83,
+      "[M+Na]+": 7,
+      "[M+K]+": 6,
+      "[M]+": 3,
+      "[M+NH4]+": 1
+    },
+    "polarity_counts": {
+      "positive": 100
+    },
+    "instrument_counts": {
+      "None/Unknown": 100
+    },
+    "frac_precursor_peak_present": 0.7,
+    "intensity_distribution": {
+      "mean": 0.049968200241765924,
+      "median": 0.00656973421569162,
+      "frac_above_0.1": 0.1164798350727999,
+      "frac_above_0.5": 0.020873598763045998
+    }
+  },
+  "test_spectral": {
+    "name": "test",
+    "n_rows": 100,
+    "n_unique_molecules": 33,
+    "spectra_per_molecule": {
+      "mean": 3.0303030303030303,
+      "median": 3.0,
+      "min": 1,
+      "max": 7
+    },
+    "peaks_per_spectrum": {
+      "mean": 251.46,
+      "median": 175.5,
+      "min": 9,
+      "max": 1661,
+      "q95": 721.3499999999998,
+      "q99": 1070.960000000003
+    },
+    "precursor_mz": {
+      "min": 250.1444,
+      "max": 388.2608,
+      "mean": 328.545804,
+      "median": 335.22365
+    },
+    "adduct_counts": {
+      "[M+H]+": 81,
+      "[M-H]-": 13,
+      "[M+CH2O2-H]-": 5,
+      "[M+Na]+": 1
+    },
+    "polarity_counts": {
+      "positive": 82,
+      "negative": 18
+    },
+    "ce_first_value": {
+      "mean": 38.6,
+      "median": 40.0
+    },
+    "instrument_counts": {
+      "timsTOF": 100
+    },
+    "frac_precursor_peak_present": 0.63,
+    "intensity_distribution": {
+      "mean": 0.020820518440750033,
+      "median": 0.0005035101952364576,
+      "frac_above_0.1": 0.036303630363036306,
+      "frac_above_0.5": 0.013083451202263084
+    }
+  },
+  "distribution_comparison": {
+    "ks_precursor_mz": {
+      "statistic": 0.36,
+      "pvalue": 3.751914289152195e-06
+    },
+    "ks_peaks_per_spec": {
+      "statistic": 0.44999999999999996,
+      "pvalue": 1.7047967801006258e-09
+    }
+  },
+  "molecule_stats": {
+    "n_molecules": 100,
+    "rdkit_parse_rate": 1.0,
+    "heavy_atom_count": {
+      "mean": 25.42,
+      "median": 22.5,
+      "min": 5,
+      "max": 77
+    },
+    "molecular_weight": {
+      "mean": 361.0481681361809,
+      "median": 320.15900949,
+      "min": 72.021129368,
+      "max": 1100.420807488
+    },
+    "element_set": {
+      "C": 1853,
+      "O": 397,
+      "N": 224,
+      "S": 26,
+      "F": 18,
+      "Cl": 17,
+      "P": 7
+    },
+    "top_formulas": {
+      "C20H15N3O2": 1,
+      "C22H23N3O4": 1,
+      "C23H26FNO4": 1,
+      "C16H13ClN2O": 1,
+      "C21H30N7O17P3": 1,
+      "C10H22N4": 1,
+      "C27H33NO4": 1,
+      "C14H8N2O": 1,
+      "C27H36N2O5": 1,
+      "C59H90O4": 1,
+      "C43H74N2O14": 1,
+      "C24H29N5O3": 1,
+      "C24H29NO3": 1,
+      "C15H14O3": 1,
+      "C15H11ClN2O2": 1,
+      "C3H7NO4S": 1,
+      "C9H11N": 1,
+      "C19H26O2": 1,
+      "C6H10O7": 1,
+      "C8H10N2S": 1
+    },
+    "top_scaffolds": {
+      "": 12,
+      "c1ccccc1": 6,
+      "O=C1CN=C(c2ccccc2)c2ccccc2N1": 3,
+      "O=C1C=CC2C(=C1)CCC1C3CCCC3CCC21": 2,
+      "O=c1[nH]c(=O)c2[nH]cnc2[nH]1": 2,
+      "O=C1NC(=O)c2cc(Nc3ccccc3)c(Nc3ccccc3)cc21": 1,
+      "c1ccc(Nc2ncnc3ccccc23)cc1": 1,
+      "C(Cc1ccc2c(c1)CCCC2)=Nc1ccccc1": 1,
+      "O=[PH](OCC1CCC(N2C=CCC=C2)O1)O[PH](=O)OCC1CCC(n2cnc3cncnc32)O1": 1,
+      "C1CCCNCCC1": 1,
+      "O=C1C=C2C(CCC3C2CCC2Cc4c([nH]c5ccccc45)C23)OC1": 1,
+      "O=C1c2ccccc2-c2n[nH]c3cccc1c23": 1,
+      "O=C1Cc2ccccc2CCN1CCCNCC1Cc2ccccc21": 1,
+      "O=C1C=CC(=O)C=C1": 1,
+      "O=C1CCCC(OC2CCC(OC3CCCCO3)CO2)CCCC(OC2CCCCO2)C=CC=CCCO1": 1,
+      "c1ccc(-c2ccccc2-c2nn[nH]n2)cc1": 1,
+      "O=C1c2ccccc2CC1CC1CCN(Cc2ccccc2)CC1": 1,
+      "c1ccc(C2COc3ccccc3C2)cc1": 1,
+      "c1ccc(C2CC2)cc1": 1,
+      "O=C1C=C2CCC3C4CCC(=O)C4CCC3C2CC1": 1
+    },
+    "n_unique_ik14": 100,
+    "n_unique_scaffolds": 80,
+    "frac_multi_fragment_salts": 0.0,
+    "frac_charged": 0.01,
+    "mass_sanity_check": {
+      "n_checked": 100,
+      "n_matched_within_10ppm": 98,
+      "frac_matched": 0.98,
+      "median_ppm_error": 0.06745082583764136,
+      "q95_ppm_error": 0.32752411362870193
+    }
+  },
+  "overlap_analysis": {
+    "n_train_molecules": 100,
+    "n_test_molecules": 33,
+    "ppm_tolerance": 5.0,
+    "n_test_with_mass_match": 0,
+    "frac_test_mass_covered": 0.0,
+    "theoretical_max_library_lookup_mrr": 0.0
+  },
+  "config": {
+    "seed": 42,
+    "SMOKE_TEST": false,
+    "smoke_n_rows": 500,
+    "time_budget_s": 3600,
+    "n_cpu_workers": 4,
+    "mp_chunk_size": 250,
+    "use_gpu_acceleration": true,
+    "data_dir": "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra",
+    "output_dir": "/kaggle/working/artifacts/eda",
+    "ppm_tolerance": 10.0,
+    "mass_match_ppm": 5.0,
+    "top_k_peaks": 200,
+    "truncate_array_len": 8
+  },
+  "timestamp": "2026-10-02T01:56:08.972967"
+}

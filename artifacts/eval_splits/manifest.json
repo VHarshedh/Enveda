@@ -1,0 +1,92 @@
+{
+  "stage": "eval_splits",
+  "timestamp": "2026-10-01T21:12:40.981088Z",
+  "cfg": {
+    "stage": "eval_splits",
+    "seed": 42,
+    "SMOKE_TEST": false,
+    "smoke_n_rows": 500,
+    "data_dir": "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra",
+    "eda_dir": "/kaggle/working/artifacts/eda",
+    "output_dir": "/kaggle/working/artifacts/eval_splits",
+    "tautomer_max_tautomers": 50,
+    "tautomer_max_transforms": 100,
+    "tautomer_timeout_s": 1.5,
+    "split3_train_ratio": 0.8,
+    "split3_val_model_ratio": 0.1,
+    "split3_val_rank_ratio": 0.1,
+    "min_val_rank_mols": 3000,
+    "top_k_metric": 25
+  },
+  "library_versions": {
+    "python": "3.12.10",
+    "rdkit": "2026.03.6",
+    "numpy": "2.5.3",
+    "pandas": "3.0.6",
+    "scipy": "1.18.1"
+  },
+  "metrics": {
+    "n_molecules": 100,
+    "split3_counts": {
+      "train": 80,
+      "val_model": 10,
+      "val_rank": 10
+    },
+    "split_random_counts": {
+      "train": 90,
+      "val": 10
+    },
+    "split_formula_counts": {
+      "train": 85,
+      "val": 15
+    },
+    "diagnostics": {
+      "split3_scaffold_overlap_vm_pct": 0.0,
+      "split3_scaffold_overlap_vr_pct": 0.0,
+      "split3_formula_overlap_vm_pct": 0.0,
+      "split3_formula_overlap_vr_pct": 0.0,
+      "random_scaffold_overlap_pct": 20.0,
+      "ks_train_vs_val_model": {
+        "statistic": 0.30000000000000004,
+        "pvalue": 0.348180999446484
+      },
+      "ks_train_vs_val_rank": {
+        "statistic": 0.4375,
+        "pvalue": 0.05029750892416496
+      }
+    }
+  },
+  "files": {
+    "evalkit.py": {
+      "size_bytes": 16520,
+      "sha256": "bf9efe5dec08581cca17c8d69d31c423943ac5d75f7a9ede248de0b048b24af0"
+    },
+    "splits.parquet": {
+      "size_bytes": 7206,
+      "sha256": "34ef88d5da0339b4c0fbc546b41efeb64b22a299bacb7abcfddf54f99055feb2"
+    },
+    "tests_passed.log": {
+      "size_bytes": 349,
+      "sha256": "1f53485949841cc42de022c590c308b5c343e4f8451c4dc4d5c3ff4ce3cc86cf"
+    },
+    "figures/split_diagnostics.png": {
+      "size_bytes": 128028,
+      "sha256": "6b320c9fb9263acf83a6708dca87e640cbb52b2f9e97ef2242ab5a31634241c6"
+    }
+  },
+  "trained_on_split": "none (validation split definition stage)",
+  "heldout_ids_hash": "5a81eac8c72d1ddef24364834ccaa241ed67b0d286367ec7a26b66199f994337",
+  "train_ids_hash": "fad58ee226edd3368a263ba69dcee928fa5d54e27467a13321b99dce9b496ae6",
+  "fp_spec": {
+    "morgan": {
+      "radius": 2,
+      "nBits": 4096,
+      "chirality": false,
+      "dtype": "uint8"
+    },
+    "maccs": {
+      "nBits": 167,
+      "dtype": "uint8"
+    }
+  }
+}

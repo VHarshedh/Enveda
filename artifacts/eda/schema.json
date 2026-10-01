@@ -1,0 +1,123 @@
+{
+  "train": {
+    "mapping": {
+      "molecule_id": "inchikey14",
+      "smiles": "normalized_smiles",
+      "precursor_mz": "precursor_mz",
+      "adduct": "adduct",
+      "adduct_orig": "adduct_orig",
+      "polarity": "ionization_mode",
+      "collision_energy": "collision_energy_ev",
+      "instrument": "instrument_type",
+      "formula": "molecular_formula",
+      "inchikey": "inchikey",
+      "inchikey14": "inchikey14",
+      "mz_array": "ms2_mzs",
+      "intensity_array": "ms2_normalized_intensities",
+      "base_peak_intensity": "base_peak_intensity",
+      "num_peaks": "num_peaks",
+      "ingest_lib": "ingest_lib"
+    },
+    "col_types": {
+      "molecule_id": "string",
+      "smiles": "string",
+      "precursor_mz": "numeric",
+      "adduct": "string",
+      "adduct_orig": "string",
+      "polarity": "string",
+      "collision_energy": "empty",
+      "instrument": "empty",
+      "formula": "string",
+      "inchikey": "string",
+      "inchikey14": "string",
+      "mz_array": "array",
+      "intensity_array": "array",
+      "base_peak_intensity": "empty",
+      "num_peaks": "numeric",
+      "ingest_lib": "string"
+    }
+  },
+  "test": {
+    "mapping": {
+      "molecule_id": "molecule_id",
+      "spectrum_id": "spectrum_id",
+      "precursor_mz": "precursor_mz",
+      "adduct": "adduct",
+      "polarity": "ionization_mode",
+      "collision_energy": "collision_energy_ev",
+      "instrument": "instrument_type",
+      "mz_array": "ms2_mzs",
+      "intensity_array": "ms2_normalized_intensities",
+      "base_peak_intensity": "base_peak_intensity"
+    },
+    "col_types": {
+      "molecule_id": "string",
+      "spectrum_id": "string",
+      "precursor_mz": "numeric",
+      "adduct": "string",
+      "polarity": "string",
+      "collision_energy": "array",
+      "instrument": "string",
+      "mz_array": "array",
+      "intensity_array": "array",
+      "base_peak_intensity": "numeric"
+    }
+  },
+  "train_columns": [
+    "ingest_lib",
+    "normalized_smiles",
+    "inchikey",
+    "inchikey14",
+    "molecular_formula",
+    "ionization_mode",
+    "instrument_type",
+    "adduct",
+    "adduct_orig",
+    "precursor_mz",
+    "precursor_error_ppm",
+    "ms2_mzs",
+    "ms2_normalized_intensities",
+    "num_peaks",
+    "base_peak_intensity",
+    "collision_energy_ev",
+    "collision_energy_orig",
+    "collision_energy_orig_units"
+  ],
+  "test_columns": [
+    "molecule_id",
+    "spectrum_id",
+    "ms2_mzs",
+    "ms2_normalized_intensities",
+    "base_peak_intensity",
+    "adduct",
+    "ionization_mode",
+    "instrument_type",
+    "precursor_mz",
+    "collision_energy_orig",
+    "collision_energy_ev",
+    "collision_energy_orig_units"
+  ],
+  "train_shape": [
+    100,
+    18
+  ],
+  "test_shape": [
+    100,
+    12
+  ],
+  "train_only_columns": [
+    "adduct_orig",
+    "inchikey",
+    "inchikey14",
+    "ingest_lib",
+    "molecular_formula",
+    "normalized_smiles",
+    "num_peaks",
+    "precursor_error_ppm"
+  ],
+  "test_only_columns": [
+    "molecule_id",
+    "spectrum_id"
+  ],
+  "timestamp": "2026-10-02T01:56:05.523937"
+}
