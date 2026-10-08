@@ -39,6 +39,13 @@ from tqdm.auto import tqdm
 
 RDLogger.DisableLog("rdApp.*")
 WORK = Path("/kaggle/working")
+_max_csv = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_max_csv)
+        break
+    except OverflowError:
+        _max_csv = int(_max_csv / 10)
 BASE_ELEMENTS = {"C", "H", "N", "O", "S", "P", "F", "Cl", "Br", "I"}
 EXTRA_ELEMENTS = {"Na", "K", "Si", "B", "Se"}
 TRAIN_BIT = 1

@@ -78,3 +78,7 @@ ehthumbs_vista.db
 *.tmp
 *.bak
 scratch/
+*.smi
+*.zip
+*.gz
+*.tsv

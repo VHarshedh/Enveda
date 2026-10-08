@@ -49,6 +49,13 @@ from tqdm.auto import tqdm
 
 RDLogger.DisableLog("rdApp.*")
 WORK = Path("/kaggle/working")
+_max_csv = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_max_csv)
+        break
+    except OverflowError:
+        _max_csv = int(_max_csv / 10)
 BASE_ELEMENTS = {"C", "H", "N", "O", "S", "P", "F", "Cl", "Br", "I"}
 EXTRA_ELEMENTS = {"Na", "K", "Si", "B", "Se"}
 TRAIN_BIT = 1
@@ -694,32 +701,32 @@ def iter_sdf_source(path, is_gz, is_zip, zip_member):
 
 def iter_delimited_source(path, spec):
     is_gz, is_zip = spec.get("is_gz", False), spec.get("is_zip", False)
+    col = spec["column_index"]
+
+    def _read(reader):
+        if spec["header"]:
+            next(reader, None)
+        while True:
+            try:
+                row = next(reader)
+            except StopIteration:
+                break
+            except csv.Error as exc:
+                print(f"[delimited_source] warning: {exc}")
+                continue
+            yield row[col] if len(row) > col else None
+
     if is_zip:
         with zipfile.ZipFile(path, "r") as zf:
             with zf.open(spec["zip_member"], "r") as raw:
                 with io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace", newline="") as handle:
-                    reader = csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True)
-                    if spec["header"]:
-                        next(reader, None)
-                    for record in reader:
-                        i = spec["column_index"]
-                        yield record[i] if len(record) > i else None
+                    yield from _read(csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True))
     elif is_gz:
         with gzip.open(path, mode="rt", encoding="utf-8-sig", errors="replace", newline="") as handle:
-            reader = csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True)
-            if spec["header"]:
-                next(reader, None)
-            for record in reader:
-                i = spec["column_index"]
-                yield record[i] if len(record) > i else None
+            yield from _read(csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True))
     else:
         with path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
-            reader = csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True)
-            if spec["header"]:
-                next(reader, None)
-            for record in reader:
-                i = spec["column_index"]
-                yield record[i] if len(record) > i else None
+            yield from _read(csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True))
 
 
 def iter_source(spec, batch_rows=8192):
@@ -1513,8 +1520,15 @@ T_START = time.perf_counter()
 print(asdict(cfg))
 """)
     code(r"""
-import gc, hashlib, importlib, json, multiprocessing as mp, random, sys
+import csv, gc, hashlib, importlib, json, multiprocessing as mp, random, sys
 from datetime import datetime, timezone
+_max_csv = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_max_csv)
+        break
+    except OverflowError:
+        _max_csv = int(_max_csv / 10)
 import numpy as np
 import pandas as pd
 import pyarrow as pa
