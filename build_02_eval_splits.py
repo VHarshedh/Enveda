@@ -156,7 +156,7 @@ try:
     n_gpus = torch.cuda.device_count()
     print(f"PyTorch Version: {torch.__version__} | GPUs detected: {n_gpus}")
     for i in range(n_gpus):
-        vram = torch.cuda.get_device_properties(i).total_mem / 1e9
+        vram = torch.cuda.get_device_properties(i).total_memory / 1e9
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({vram:.1f} GB VRAM)")
 except ImportError:
     print("PyTorch not installed (CPU environment)")

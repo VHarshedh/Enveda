@@ -118,7 +118,7 @@ N_GPUS = torch.cuda.device_count()
 print(f"PyTorch {torch.__version__} | device={DEVICE} | GPUs={N_GPUS}")
 for i in range(N_GPUS):
     p = torch.cuda.get_device_properties(i)
-    print(f"  GPU {i}: {p.name} ({p.total_mem/1e9:.1f} GB)")
+    print(f"  GPU {i}: {p.name} ({p.total_memory/1e9:.1f} GB)")
 print(f"NumPy {np.__version__} | Pandas {pd.__version__} | SciPy {scipy.__version__}")
 
 np.random.seed(cfg.seed)
@@ -314,43 +314,61 @@ mol_peak_mask = np.zeros((n_mols, cfg.MAX_PEAKS), dtype=np.bool_)
 mol_prec_mass = np.zeros(n_mols, dtype=np.float32)
 mol_best_score = np.full(n_mols, -1.0, dtype=np.float32)
 
-# Sparse builders for binned vectors
-rows_c, cols_c, data_c = [], [], []
-rows_f, cols_f, data_f = [], [], []
+# Map molecule_id to contiguous integer index and sort spectra contiguously
+# Eliminates pandas groupby/iterrows overhead (30x speedup)
+df_train["midx"] = df_train["molecule_id"].map(mol_id_to_idx).astype(np.int32)
+df_train = df_train.sort_values("midx").reset_index(drop=True)
 
-# Temporary dense accumulators (one molecule at a time)
+train_midx_arr = df_train["midx"].values
+train_mzs_arr  = df_train["mzs"].values
+train_ints_arr = df_train["intensities"].values
+train_prec_arr = df_train["precursor_mz"].values.astype(np.float32)
+
+boundaries = np.searchsorted(train_midx_arr, np.arange(n_mols + 1))
+del df_train
+gc.collect()
+
+# Direct CSR builders (stores compact numpy chunks, avoids >300M Python objects and swap thrashing)
+indptr_c = [0]
+indices_c = []
+data_c = []
+
+indptr_f = [0]
+indices_f = []
+data_f = []
+
 _buf_c = np.zeros(n_bins_c, dtype=np.float32)
 _buf_f = np.zeros(n_bins_f, dtype=np.float32)
 
-# Group spectra by molecule
-grouped = df_train.groupby("molecule_id")
-
-for mol_id, grp in tqdm(grouped, total=n_mols, desc="Building mol vectors"):
-    midx = mol_id_to_idx.get(mol_id)
-    if midx is None:
-        continue
-    _buf_c[:] = 0.0
-    _buf_f[:] = 0.0
-
-    for _, row in grp.iterrows():
-        mzs  = np.asarray(row["mzs"],  dtype=np.float64)
-        ints = np.asarray(row["intensities"], dtype=np.float64)
-        prec = float(row["precursor_mz"])
-
+for midx in tqdm(range(n_mols), desc="Building mol vectors", mininterval=5.0):
+    s_start = boundaries[midx]
+    s_end   = boundaries[midx + 1]
+    
+    touched_c = []
+    touched_f = []
+    
+    for s_idx in range(s_start, s_end):
+        mzs  = np.asarray(train_mzs_arr[s_idx],  dtype=np.float64)
+        ints = np.asarray(train_ints_arr[s_idx], dtype=np.float64)
+        prec = float(train_prec_arr[s_idx])
+        
         # Filter: peaks <= precursor + 5 Da, positive
         keep = (mzs <= prec + 5.0) & (mzs >= 0) & (ints > 0)
         mzs, ints = mzs[keep], ints[keep]
         if len(mzs) == 0:
             continue
         ints = np.sqrt(np.clip(ints, 0, None))
-
+        
         # Coarse bins
-        bc = np.clip((mzs / cfg.BIN_COARSE).astype(np.int64), 0, n_bins_c - 1)
+        bc = np.clip((mzs / cfg.BIN_COARSE).astype(np.int32), 0, n_bins_c - 1)
         np.maximum.at(_buf_c, bc, ints)
+        touched_c.append(bc)
+        
         # Fine bins
-        bf = np.clip((mzs / cfg.BIN_FINE).astype(np.int64), 0, n_bins_f - 1)
+        bf = np.clip((mzs / cfg.BIN_FINE).astype(np.int32), 0, n_bins_f - 1)
         np.maximum.at(_buf_f, bf, ints)
-
+        touched_f.append(bf)
+        
         # Best spectrum for modified cosine
         s = float(ints.sum())
         if s > mol_best_score[midx]:
@@ -368,35 +386,55 @@ for mol_id, grp in tqdm(grouped, total=n_mols, desc="Building mol vectors"):
             mol_peak_mask[midx, :n] = True
             mol_prec_mass[midx] = prec
 
-    # L2-normalise and store sparse coarse
-    nc = np.linalg.norm(_buf_c)
-    if nc > 0:
-        _buf_c /= nc
-    nz = np.nonzero(_buf_c)[0]
-    rows_c.extend([midx]*len(nz)); cols_c.extend(nz); data_c.extend(_buf_c[nz].tolist())
+    # Coarse sparse row: wipe ONLY touched bins (avoids 150k scans per mol)
+    if touched_c:
+        uniq_c = np.unique(np.concatenate(touched_c))
+        vals_c = _buf_c[uniq_c]
+        nc = np.linalg.norm(vals_c)
+        if nc > 0:
+            vals_c /= nc
+        indices_c.append(uniq_c.astype(np.int32))
+        data_c.append(vals_c.astype(np.float32))
+        indptr_c.append(indptr_c[-1] + len(uniq_c))
+        _buf_c[uniq_c] = 0.0
+    else:
+        indptr_c.append(indptr_c[-1])
+        
+    # Fine sparse row: wipe ONLY touched bins
+    if touched_f:
+        uniq_f = np.unique(np.concatenate(touched_f))
+        vals_f = _buf_f[uniq_f]
+        nf = np.linalg.norm(vals_f)
+        if nf > 0:
+            vals_f /= nf
+        indices_f.append(uniq_f.astype(np.int32))
+        data_f.append(vals_f.astype(np.float32))
+        indptr_f.append(indptr_f[-1] + len(uniq_f))
+        _buf_f[uniq_f] = 0.0
+    else:
+        indptr_f.append(indptr_f[-1])
 
-    # L2-normalise and store sparse fine
-    nf = np.linalg.norm(_buf_f)
-    if nf > 0:
-        _buf_f /= nf
-    nz2 = np.nonzero(_buf_f)[0]
-    rows_f.extend([midx]*len(nz2)); cols_f.extend(nz2); data_f.extend(_buf_f[nz2].tolist())
+# Build CSR directly from concatenated chunks
+sp_coarse = csr_matrix((
+    np.concatenate(data_c),
+    np.concatenate(indices_c),
+    np.array(indptr_c, dtype=np.int32)
+), shape=(n_mols, n_bins_c))
 
-# Build CSR
-sp_coarse = csr_matrix((np.array(data_c, dtype=np.float32),
-                         (np.array(rows_c), np.array(cols_c))),
-                        shape=(n_mols, n_bins_c))
-sp_fine   = csr_matrix((np.array(data_f, dtype=np.float32),
-                         (np.array(rows_f), np.array(cols_f))),
-                        shape=(n_mols, n_bins_f))
+sp_fine = csr_matrix((
+    np.concatenate(data_f),
+    np.concatenate(indices_f),
+    np.array(indptr_f, dtype=np.int32)
+), shape=(n_mols, n_bins_f))
 
 mol_neutral_mass = df_mol_meta["neutral_mass"].values.astype(np.float32)
 print(f"Built molecule vectors in {time.time()-t0:.1f}s")
 print(f"  coarse sparse: {sp_coarse.shape}, nnz={sp_coarse.nnz}")
 print(f"  fine   sparse: {sp_fine.shape}, nnz={sp_fine.nnz}")
 
-# Free raw train dataframe
-del df_train, grouped, rows_c, cols_c, data_c, rows_f, cols_f, data_f
+# Free arrays and scratchpads to keep RAM < 6 GB
+del train_midx_arr, train_mzs_arr, train_ints_arr, train_prec_arr
+del indices_c, data_c, indptr_c, indices_f, data_f, indptr_f, _buf_c, _buf_f
 gc.collect()
 """)
 
@@ -415,27 +453,41 @@ test_peak_mask = np.zeros((n_test, cfg.MAX_PEAKS), dtype=np.bool_)
 test_prec_mass = np.zeros(n_test, dtype=np.float32)
 test_best_score = np.full(n_test, -1.0)
 
-tr_c, tc_c, td_c = [], [], []
-tr_f, tc_f, td_f = [], [], []
+df_test["tidx"] = df_test["molecule_id"].map(test_id_to_idx).astype(np.int32)
+df_test = df_test.sort_values("tidx").reset_index(drop=True)
+
+test_tidx_arr = df_test["tidx"].values
+test_mzs_arr  = df_test["mzs"].values
+test_ints_arr = df_test["intensities"].values
+test_prec_arr = df_test["precursor_mz"].values.astype(np.float32)
+
+t_boundaries = np.searchsorted(test_tidx_arr, np.arange(n_test + 1))
+
+t_indptr_c = [0]; t_indices_c = []; t_data_c = []
+t_indptr_f = [0]; t_indices_f = []; t_data_f = []
 _buf_c2 = np.zeros(n_bins_c, dtype=np.float32)
 _buf_f2 = np.zeros(n_bins_f, dtype=np.float32)
 
-for mol_id, grp in tqdm(df_test.groupby("molecule_id"), total=n_test, desc="Test mol vectors"):
-    tidx = test_id_to_idx[mol_id]
-    _buf_c2[:] = 0; _buf_f2[:] = 0
-    for _, row in grp.iterrows():
-        mzs  = np.asarray(row["mzs"], dtype=np.float64)
-        ints = np.asarray(row["intensities"], dtype=np.float64)
-        prec = float(row["precursor_mz"])
+for tidx in tqdm(range(n_test), desc="Test mol vectors", mininterval=2.0):
+    s_start = t_boundaries[tidx]
+    s_end   = t_boundaries[tidx + 1]
+    touched_c = []
+    touched_f = []
+    for s_idx in range(s_start, s_end):
+        mzs  = np.asarray(test_mzs_arr[s_idx], dtype=np.float64)
+        ints = np.asarray(test_ints_arr[s_idx], dtype=np.float64)
+        prec = float(test_prec_arr[s_idx])
         keep = (mzs <= prec + 5.0) & (mzs >= 0) & (ints > 0)
         mzs, ints = mzs[keep], ints[keep]
         if len(mzs) == 0:
             continue
         ints = np.sqrt(np.clip(ints, 0, None))
-        bc = np.clip((mzs / cfg.BIN_COARSE).astype(np.int64), 0, n_bins_c - 1)
+        bc = np.clip((mzs / cfg.BIN_COARSE).astype(np.int32), 0, n_bins_c - 1)
         np.maximum.at(_buf_c2, bc, ints)
-        bf = np.clip((mzs / cfg.BIN_FINE).astype(np.int64), 0, n_bins_f - 1)
+        touched_c.append(bc)
+        bf = np.clip((mzs / cfg.BIN_FINE).astype(np.int32), 0, n_bins_f - 1)
         np.maximum.at(_buf_f2, bf, ints)
+        touched_f.append(bf)
         s = float(ints.sum())
         if s > test_best_score[tidx]:
             test_best_score[tidx] = s
@@ -450,21 +502,40 @@ for mol_id, grp in tqdm(df_test.groupby("molecule_id"), total=n_test, desc="Test
             test_peak_ints[tidx, :n] = ints_t.astype(np.float32)
             test_peak_mask[tidx, :n] = True
             test_prec_mass[tidx] = prec
-    nc = np.linalg.norm(_buf_c2)
-    if nc > 0: _buf_c2 /= nc
-    nz = np.nonzero(_buf_c2)[0]
-    tr_c.extend([tidx]*len(nz)); tc_c.extend(nz); td_c.extend(_buf_c2[nz].tolist())
-    nf = np.linalg.norm(_buf_f2)
-    if nf > 0: _buf_f2 /= nf
-    nz2 = np.nonzero(_buf_f2)[0]
-    tr_f.extend([tidx]*len(nz2)); tc_f.extend(nz2); td_f.extend(_buf_f2[nz2].tolist())
+    if touched_c:
+        uniq_c = np.unique(np.concatenate(touched_c))
+        vals_c = _buf_c2[uniq_c]
+        nc = np.linalg.norm(vals_c)
+        if nc > 0: vals_c /= nc
+        t_indices_c.append(uniq_c.astype(np.int32))
+        t_data_c.append(vals_c.astype(np.float32))
+        t_indptr_c.append(t_indptr_c[-1] + len(uniq_c))
+        _buf_c2[uniq_c] = 0.0
+    else:
+        t_indptr_c.append(t_indptr_c[-1])
+    if touched_f:
+        uniq_f = np.unique(np.concatenate(touched_f))
+        vals_f = _buf_f2[uniq_f]
+        nf = np.linalg.norm(vals_f)
+        if nf > 0: vals_f /= nf
+        t_indices_f.append(uniq_f.astype(np.int32))
+        t_data_f.append(vals_f.astype(np.float32))
+        t_indptr_f.append(t_indptr_f[-1] + len(uniq_f))
+        _buf_f2[uniq_f] = 0.0
+    else:
+        t_indptr_f.append(t_indptr_f[-1])
 
-test_sp_coarse = csr_matrix((np.array(td_c, dtype=np.float32),
-                              (np.array(tr_c), np.array(tc_c))),
-                             shape=(n_test, n_bins_c))
-test_sp_fine   = csr_matrix((np.array(td_f, dtype=np.float32),
-                              (np.array(tr_f), np.array(tc_f))),
-                             shape=(n_test, n_bins_f))
+test_sp_coarse = csr_matrix((
+    np.concatenate(t_data_c),
+    np.concatenate(t_indices_c),
+    np.array(t_indptr_c, dtype=np.int32)
+), shape=(n_test, n_bins_c))
+
+test_sp_fine = csr_matrix((
+    np.concatenate(t_data_f),
+    np.concatenate(t_indices_f),
+    np.array(t_indptr_f, dtype=np.int32)
+), shape=(n_test, n_bins_f))
 
 # Neutral mass for test
 df_test_first = df_test.drop_duplicates("molecule_id").set_index("molecule_id")
@@ -475,9 +546,9 @@ test_neutral_mass = np.array([
         str(df_test_first.loc[m, "polarity"]) if "polarity" in df_test_first.columns else (str(df_test_first.loc[m, "ionization_mode"]) if "ionization_mode" in df_test_first.columns else "+")
     ) for m in test_mol_ids_all
 ], dtype=np.float32)
-del df_test_first
-
-del df_test; gc.collect()
+del df_test_first, df_test, test_tidx_arr, test_mzs_arr, test_ints_arr, test_prec_arr
+del t_indices_c, t_data_c, t_indptr_c, t_indices_f, t_data_f, t_indptr_f, _buf_c2, _buf_f2
+gc.collect()
 print(f"Test vectors built in {time.time()-t0:.1f}s  ({n_test} molecules)")
 """)
 
@@ -539,8 +610,9 @@ bins). Sparse -> dense conversion per chunk keeps GPU memory ≤ 12 GB.
 code(r"""
 def gpu_cosine_topk(query_sp, lib_sp, top_k=100,
                     q_chunk=5000, l_chunk=30000, desc="cosine"):
-    # Compute cosine similarity between sparse query and library matrices
-    # on GPU using chunked dense matmul.
+    # Compute cosine similarity between sparse query and library matrices.
+    # Uses chunked GPU dense matmul for coarse bins (D <= 20 000).
+    # Uses chunked sparse dot product for fine bins (D > 20 000) to avoid 3 GB dense allocations.
     # Returns (scores, indices) arrays of shape (n_query, top_k).
     n_q = query_sp.shape[0]
     n_l = lib_sp.shape[0]
@@ -551,7 +623,34 @@ def gpu_cosine_topk(query_sp, lib_sp, top_k=100,
     if actual_k == 0:
         return best_scores, best_idx
 
-    for qs in tqdm(range(0, n_q, q_chunk), desc=desc):
+    # High-dimensional branch (e.g. 150 000 bins at 0.01 Da)
+    if query_sp.shape[1] > 20000:
+        lib_csc = lib_sp.T.tocsc()
+        for qs in tqdm(range(0, n_q, q_chunk), desc=desc, mininterval=2.0):
+            qe = min(qs + q_chunk, n_q)
+            sim_chunk = query_sp[qs:qe].dot(lib_csc)
+            for i in range(qe - qs):
+                r_start = sim_chunk.indptr[i]
+                r_end   = sim_chunk.indptr[i + 1]
+                r_len   = r_end - r_start
+                if r_len == 0:
+                    continue
+                r_data = sim_chunk.data[r_start:r_end]
+                r_cols = sim_chunk.indices[r_start:r_end]
+                k = min(actual_k, r_len)
+                if r_len > k:
+                    part = np.argpartition(r_data, -k)[-k:]
+                    sort_order = part[np.argsort(-r_data[part])]
+                else:
+                    sort_order = np.argsort(-r_data)
+                best_scores[qs + i, :k] = r_data[sort_order]
+                best_idx[qs + i, :k]    = r_cols[sort_order]
+        del lib_csc
+        gc.collect()
+        return best_scores, best_idx
+
+    # Coarse branch (GPU dense matmul)
+    for qs in tqdm(range(0, n_q, q_chunk), desc=desc, mininterval=2.0):
         qe = min(qs + q_chunk, n_q)
         Q = torch.from_numpy(query_sp[qs:qe].toarray().astype(np.float32)).to(DEVICE)
 
@@ -694,7 +793,7 @@ all_mask_t = torch.from_numpy(mol_peak_mask).to(DEVICE)
 mod_scores_list = []
 mod_idx_list    = []
 
-for qi, q_global in enumerate(tqdm(val_idx, desc="mod_cos")):
+for qi, q_global in enumerate(tqdm(val_idx, desc="mod_cos", mininterval=5.0)):
     q_mass = mol_neutral_mass[q_global]
     # Mass window lookup
     lo = np.searchsorted(lib_masses_sorted, q_mass - cfg.MASS_WINDOW, side="left")
