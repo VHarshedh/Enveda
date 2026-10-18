@@ -186,7 +186,11 @@ class Spec2FPModel(nn.Module):
         B = peaks.size(0)
         x = self.peak_proj(peaks)
         cls = self.cls_token.expand(B, -1, -1)
-        meta1 = self.adduct_emb(adduct) + self.ce_proj(ce.unsqueeze(-1)) + self.prec_proj(prec_mz.unsqueeze(-1))
+        meta1 = (
+            self.adduct_emb(adduct)
+            + self.ce_proj(ce.unsqueeze(-1) / 100.0)
+            + self.prec_proj(prec_mz.unsqueeze(-1) / 1000.0)
+        )
         meta2 = self.inst_emb(instrument) + self.pol_emb(polarity)
         meta = torch.stack([meta1, meta2], dim=1)
         x = torch.cat([cls, meta, x], dim=1)
@@ -800,7 +804,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
     steps_per_epoch = max(len(dl_train), 1)
     budget_s = cfg.TRAIN_BUDGET_H * 3600
-    est_s_per_step = 0.5
+    est_s_per_step = 0.12
     max_epochs = max(int(budget_s / (est_s_per_step * steps_per_epoch)), 4)
     total_steps = max_epochs * steps_per_epoch
     warmup_steps = int(total_steps * cfg.WARMUP_FRAC)
@@ -825,12 +829,12 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
             pos_weight=pw_tensor, reduction="mean")
         maccs_loss = F.binary_cross_entropy_with_logits(
             out["maccs_logits"], batch["maccs_fp"].to(DEVICE), reduction="mean")
-        heavy_loss = F.mse_loss(out["heavy_atoms"], batch["heavy_atoms"].to(DEVICE))
-        ring_loss = F.mse_loss(out["ring_count"], batch["ring_count"].to(DEVICE))
+        heavy_loss = F.smooth_l1_loss(out["heavy_atoms"], batch["heavy_atoms"].to(DEVICE))
+        ring_loss = F.smooth_l1_loss(out["ring_count"], batch["ring_count"].to(DEVICE))
         epres_loss = F.binary_cross_entropy_with_logits(
             out["elem_presence"], batch["elem_presence"].to(DEVICE), reduction="mean")
-        ecount_loss = F.mse_loss(out["elem_count"], batch["elem_count"].to(DEVICE))
-        total = fp_loss + 0.5 * maccs_loss + 0.1 * heavy_loss + 0.1 * ring_loss + 0.2 * epres_loss + 0.1 * ecount_loss
+        ecount_loss = F.smooth_l1_loss(out["elem_count"], batch["elem_count"].to(DEVICE))
+        total = fp_loss + 0.5 * maccs_loss + 0.01 * heavy_loss + 0.02 * ring_loss + 0.2 * epres_loss + 0.02 * ecount_loss
         return total, fp_loss.item()
     """)
 
@@ -1104,9 +1108,8 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     md("## 16. Manifest Contract & Sanity Verifications")
     code(r"""
     elapsed = time.perf_counter() - T_START
-    vm_ids = sorted(val_model_split["molecule_id"].unique().tolist())
-    vr_ids = sorted(val_rank_split["molecule_id"].unique().tolist())
-    heldout_hash = hashlib.sha256(json.dumps(vm_ids + vr_ids).encode()).hexdigest()
+    heldout_ids = sorted(set(val_model_split["molecule_id"]).union(set(val_rank_split["molecule_id"])))
+    heldout_hash = hashlib.sha256("".join(heldout_ids).encode()).hexdigest()
 
     manifest = {
         "stage": "spec2fp",
@@ -1117,7 +1120,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
             "numpy": np.__version__, "pandas": pd.__version__, "torch": torch.__version__,
         },
         "metrics": val_metrics,
-        "trained_on_split": "split3_train",
+        "trained_on_split": "train",
         "heldout_ids_hash": heldout_hash,
         "fp_spec": evalkit.FP_SPEC,
         "model_params": n_params,
@@ -1142,7 +1145,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
         assert (root / art).exists(), f"Missing required artifact: {art}"
 
     m_loaded = json.loads((root / "manifest.json").read_text())
-    assert m_loaded["trained_on_split"] == "split3_train", "Split contract mismatch in manifest!"
+    assert m_loaded["trained_on_split"] == "train", "Split contract mismatch in manifest!"
     assert m_loaded["fp_spec"] == evalkit.FP_SPEC, "FP spec contract mismatch!"
     print(f"All {len(required_artifacts)} artifact assertions PASSED successfully!")
     """)
