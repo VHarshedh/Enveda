@@ -57,7 +57,7 @@ while True:
     except OverflowError:
         _max_csv = int(_max_csv / 10)
 BASE_ELEMENTS = {"C", "H", "N", "O", "S", "P", "F", "Cl", "Br", "I"}
-EXTRA_ELEMENTS = {"Na", "K", "Si", "B", "Se"}
+EXTRA_ELEMENTS = {"Na", "K", "Ca", "Li", "Mg", "Fe", "Zn", "Co", "Cu", "Mn", "Mo", "Ni", "V", "W", "B", "Si", "Se", "As"}
 TRAIN_BIT = 1
 DB_COLUMNS = ["row_id", "ik14", "smiles", "formula", "mass",
               "source_mask", "fast_key", "identity_kind"]
@@ -480,7 +480,7 @@ def prepare_train(db, pool, cfg):
             db.executemany(UPSERT, good)
         db.executemany("INSERT OR REPLACE INTO train_structures VALUES (?,?,?,?,?,?,?)", mapping)
         db.commit()
-    allowed = sorted(BASE_ELEMENTS | (found_elements & EXTRA_ELEMENTS))
+    allowed = sorted(BASE_ELEMENTS | EXTRA_ELEMENTS)
     state_set(db, "allowed_elements", allowed)
     state_set(db, "train_rejections", dict(statuses))
     state_set(db, "train_done", True)
@@ -1561,7 +1561,7 @@ for i in range(torch.cuda.device_count()):
 Write `candidates.py` to `/kaggle/working/candidates.py` via `%%writefile`.
 Standardize molecules via RDKit: retain largest fragment, neutralize formal charges,
 strip isotopes, remove stereochemistry, sanitize, drop heavy atoms > 150, drop disallowed
-elements outside {C, H, N, O, S, P, F, Cl, Br, I, Na, K, Si, B, Se}.
+elements outside the bio-organic and natural product set (C, H, N, O, S, P, halogens, bio-metals, and trace metalloids).
 Bulk de-duplication across external sources uses `evalkit.fast_key`.
 """)
     add_module_cells(MODULE_SOURCE)

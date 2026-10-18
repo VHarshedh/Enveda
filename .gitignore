@@ -82,3 +82,6 @@ scratch/
 *.zip
 *.gz
 *.tsv
+*.npy
+*.sqlite
+tmp_kaggle/

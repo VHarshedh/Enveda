@@ -47,7 +47,7 @@ while True:
     except OverflowError:
         _max_csv = int(_max_csv / 10)
 BASE_ELEMENTS = {"C", "H", "N", "O", "S", "P", "F", "Cl", "Br", "I"}
-EXTRA_ELEMENTS = {"Na", "K", "Si", "B", "Se"}
+EXTRA_ELEMENTS = {"Na", "K", "Ca", "Li", "Mg", "Fe", "Zn", "Co", "Cu", "Mn", "Mo", "Ni", "V", "W", "B", "Si", "Se", "As"}
 TRAIN_BIT = 1
 DB_COLUMNS = ["row_id", "ik14", "smiles", "formula", "mass",
               "source_mask", "fast_key", "identity_kind"]
@@ -470,7 +470,7 @@ def prepare_train(db, pool, cfg):
             db.executemany(UPSERT, good)
         db.executemany("INSERT OR REPLACE INTO train_structures VALUES (?,?,?,?,?,?,?)", mapping)
         db.commit()
-    allowed = sorted(BASE_ELEMENTS | (found_elements & EXTRA_ELEMENTS))
+    allowed = sorted(BASE_ELEMENTS | EXTRA_ELEMENTS)
     state_set(db, "allowed_elements", allowed)
     state_set(db, "train_rejections", dict(statuses))
     state_set(db, "train_done", True)
@@ -691,32 +691,32 @@ def iter_sdf_source(path, is_gz, is_zip, zip_member):
 
 def iter_delimited_source(path, spec):
     is_gz, is_zip = spec.get("is_gz", False), spec.get("is_zip", False)
+    col = spec["column_index"]
+
+    def _read(reader):
+        if spec["header"]:
+            next(reader, None)
+        while True:
+            try:
+                row = next(reader)
+            except StopIteration:
+                break
+            except csv.Error as exc:
+                print(f"[delimited_source] warning: {exc}")
+                continue
+            yield row[col] if len(row) > col else None
+
     if is_zip:
         with zipfile.ZipFile(path, "r") as zf:
             with zf.open(spec["zip_member"], "r") as raw:
                 with io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace", newline="") as handle:
-                    reader = csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True)
-                    if spec["header"]:
-                        next(reader, None)
-                    for record in reader:
-                        i = spec["column_index"]
-                        yield record[i] if len(record) > i else None
+                    yield from _read(csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True))
     elif is_gz:
         with gzip.open(path, mode="rt", encoding="utf-8-sig", errors="replace", newline="") as handle:
-            reader = csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True)
-            if spec["header"]:
-                next(reader, None)
-            for record in reader:
-                i = spec["column_index"]
-                yield record[i] if len(record) > i else None
+            yield from _read(csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True))
     else:
         with path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
-            reader = csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True)
-            if spec["header"]:
-                next(reader, None)
-            for record in reader:
-                i = spec["column_index"]
-                yield record[i] if len(record) > i else None
+            yield from _read(csv.reader(handle, delimiter=spec["delimiter"], skipinitialspace=True))
 
 
 def iter_source(spec, batch_rows=8192):
