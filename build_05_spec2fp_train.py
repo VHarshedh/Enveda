@@ -2,7 +2,7 @@
 
 Embeds spec2fp.py module source via %%writefile. Uses nbformat + ast validation.
 Strictly eliminates DataParallel B=1 scatter crashes, iterrows bottlenecks,
-evalkit cold-start failures, and array parsing errors.
+evalkit cold-start failures, host RAM OOM, and array parsing errors.
 """
 from pathlib import Path
 import ast
@@ -34,7 +34,7 @@ SPEC2FP_SOURCE = r'''"""spec2fp.py - Spectrum-to-Fingerprint model, tensorizatio
 Defines the Spec2FP Transformer, peak tensorization, and predict() API.
 Import ONLY from /kaggle/working/.
 """
-import json, math, sys, warnings
+import json, math, sys, warnings, gc
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 import numpy as np
@@ -87,7 +87,7 @@ def sinusoidal_embed(values: np.ndarray, dim: int = 64) -> np.ndarray:
 
 def tensorize_spectrum(
     mz: Any, inten: Any, precursor_mz: float,
-    adduct: str, ce: float, instrument: str, polarity: str,
+    adduct: Any, ce: float, instrument: Any, polarity: Any,
     top_k: int = 128, mz_dim: int = 64,
 ) -> Dict[str, np.ndarray]:
     """Convert a single spectrum into model-ready numpy arrays."""
@@ -110,9 +110,9 @@ def tensorize_spectrum(
     nl_emb = sinusoidal_embed(nl, mz_dim)
     log_int = np.log1p(inten).astype(np.float32).reshape(-1, 1)
     peak_feat = np.concatenate([mz_emb, log_int, nl_emb], axis=1).astype(np.float32)
-    adduct_idx = ADDUCT2IDX.get(str(adduct).strip(), ADDUCT2IDX["<unk>"])
-    inst_idx = INST2IDX.get(str(instrument).strip(), INST2IDX["<unk>"])
-    pol_idx = POLARITY2IDX.get(str(polarity).strip().lower(), POLARITY2IDX["<unk>"])
+    adduct_idx = int(adduct) if isinstance(adduct, (int, np.integer)) else ADDUCT2IDX.get(str(adduct).strip(), ADDUCT2IDX["<unk>"])
+    inst_idx = int(instrument) if isinstance(instrument, (int, np.integer)) else INST2IDX.get(str(instrument).strip(), INST2IDX["<unk>"])
+    pol_idx = int(polarity) if isinstance(polarity, (int, np.integer)) else POLARITY2IDX.get(str(polarity).strip().lower(), POLARITY2IDX["<unk>"])
     ce_val = float(ce) if not (ce is None or (isinstance(ce, float) and math.isnan(ce))) else 0.0
     return {
         "peak_feat": peak_feat, "n_peaks": n,
@@ -154,16 +154,11 @@ class Spec2FPModel(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
-        d = cfg.get("d_model", 320)
-        n_layers = cfg.get("n_layers", 5)
-        n_heads = cfg.get("n_heads", 8)
-        dropout = cfg.get("dropout", 0.1)
-        feat_dim = cfg.get("feat_dim", 129)
-        fp_bits = cfg.get("fp_bits", 4096)
-        maccs_bits = cfg.get("maccs_bits", 167)
+        d, n_layers, n_heads = cfg.get("d_model", 320), cfg.get("n_layers", 5), cfg.get("n_heads", 8)
+        dropout, feat_dim = cfg.get("dropout", 0.1), cfg.get("feat_dim", 129)
+        fp_bits, maccs_bits = cfg.get("fp_bits", 4096), cfg.get("maccs_bits", 167)
         n_elements = cfg.get("n_elements", N_ELEMENTS)
-        self.peak_proj = nn.Sequential(
-            nn.Linear(feat_dim, d), nn.GELU(), nn.LayerNorm(d), nn.Dropout(dropout))
+        self.peak_proj = nn.Sequential(nn.Linear(feat_dim, d), nn.GELU(), nn.LayerNorm(d), nn.Dropout(dropout))
         self.cls_token = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         self.adduct_emb = nn.Embedding(len(ADDUCT_VOCAB), d, padding_idx=0)
         self.inst_emb = nn.Embedding(len(INST_VOCAB), d, padding_idx=0)
@@ -223,44 +218,37 @@ def load_model(config_path: str, weights_path: str, device: str = "cpu"):
     return model.to(device), cfg
 
 
-def _pool_molecule_predictions(all_fp_arr: np.ndarray, all_elem_arr: np.ndarray, mol_ids_arr: np.ndarray):
-    """Aggregate per-spectrum predictions into mean-pooled per-molecule predictions."""
-    unique_mols, inv_indices = np.unique(mol_ids_arr, return_inverse=True)
-    n_unique = len(unique_mols)
-    fp_sum = np.zeros((n_unique, 4096), dtype=np.float32)
-    elem_sum = np.zeros((n_unique, N_ELEMENTS), dtype=np.float32)
-    counts = np.zeros(n_unique, dtype=np.float32)
-    np.add.at(fp_sum, inv_indices, all_fp_arr)
-    np.add.at(elem_sum, inv_indices, all_elem_arr)
-    np.add.at(counts, inv_indices, 1.0)
-    counts_col = np.maximum(counts, 1.0)[:, None]
-    return (fp_sum / counts_col).astype(np.float16), (elem_sum / counts_col).astype(np.float32), unique_mols.tolist()
-
-
 @torch.no_grad()
 def predict(model, clean_df, device="cuda", batch_size=128, top_k=128, mz_dim=64):
-    """Predict fingerprints + element info for clean_df table with batched inference."""
+    """Predict fingerprints + element info with streaming molecule-level pooling."""
     raw_model = model.module if hasattr(model, "module") else model
     raw_model.eval()
     feat_dim, n_rows = 2 * mz_dim + 1, len(clean_df)
     if n_rows == 0:
         return (np.zeros((0, 4096), dtype=np.float16), np.zeros((0, N_ELEMENTS), dtype=np.float32), [])
 
-    mz_col, int_col = clean_df["mz"].tolist(), clean_df["inten"].tolist()
-    pmz_col = clean_df["precursor_mz"].tolist()
-    add_col = clean_df["adduct"].tolist() if "adduct" in clean_df.columns else ["[M+H]+"] * n_rows
-    ce_col = clean_df["ce"].tolist() if "ce" in clean_df.columns else [0.0] * n_rows
-    inst_col = clean_df["instrument"].tolist() if "instrument" in clean_df.columns else ["unknown"] * n_rows
-    pol_col = clean_df["polarity"].tolist() if "polarity" in clean_df.columns else ["positive"] * n_rows
-    dev_type, is_cuda = "cuda" if "cuda" in str(device) else "cpu", "cuda" in str(device)
-    all_fps, all_elems = [], []
+    mol_ids_arr = clean_df["molecule_id"].to_numpy().astype(str)
+    unique_mols, inv_indices = np.unique(mol_ids_arr, return_inverse=True)
+    n_unique = len(unique_mols)
+    fp_sum = np.zeros((n_unique, 4096), dtype=np.float32)
+    elem_sum = np.zeros((n_unique, N_ELEMENTS), dtype=np.float32)
+    counts = np.zeros(n_unique, dtype=np.float32)
+
+    mz_col = clean_df["mz"].to_numpy()
+    int_col = clean_df["inten"].to_numpy()
+    pmz_col = clean_df["precursor_mz"].to_numpy(dtype=np.float32)
+    add_col = clean_df["adduct"].to_numpy() if "adduct" in clean_df.columns else np.array(["[M+H]+"] * n_rows)
+    ce_col = pd.to_numeric(clean_df["ce"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32) if "ce" in clean_df.columns else np.zeros(n_rows, dtype=np.float32)
+    inst_col = clean_df["instrument"].to_numpy() if "instrument" in clean_df.columns else np.array(["unknown"] * n_rows)
+    pol_col = clean_df["polarity"].to_numpy() if "polarity" in clean_df.columns else np.array(["positive"] * n_rows)
+    dev_type, is_cuda = ("cuda" if "cuda" in str(device) else "cpu"), ("cuda" in str(device))
 
     for s_idx in range(0, n_rows, batch_size):
         e_idx = min(s_idx + batch_size, n_rows)
         items = [
             tensorize_spectrum(
                 mz_col[r], int_col[r], float(pmz_col[r]),
-                str(add_col[r]), float(ce_col[r]) if pd.notna(ce_col[r]) else 0.0,
+                str(add_col[r]), float(ce_col[r]),
                 str(inst_col[r]), str(pol_col[r]), top_k=top_k, mz_dim=mz_dim)
             for r in range(s_idx, e_idx)
         ]
@@ -268,13 +256,15 @@ def predict(model, clean_df, device="cuda", batch_size=128, top_k=128, mz_dim=64
         bd = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in bd.items()}
         with torch.amp.autocast(device_type=dev_type, dtype=torch.float16, enabled=is_cuda):
             out = raw_model(**bd)
-        all_fps.append(torch.sigmoid(out["fp_logits"]).float().cpu().numpy())
-        all_elems.append(out["elem_count"].float().cpu().numpy())
+        batch_fp = torch.sigmoid(out["fp_logits"]).float().cpu().numpy()
+        batch_elem = out["elem_count"].float().cpu().numpy()
+        batch_inv = inv_indices[s_idx:e_idx]
+        np.add.at(fp_sum, batch_inv, batch_fp)
+        np.add.at(elem_sum, batch_inv, batch_elem)
+        np.add.at(counts, batch_inv, 1.0)
 
-    all_fp_arr = np.concatenate(all_fps, axis=0)
-    all_elem_arr = np.concatenate(all_elems, axis=0)
-    mol_ids = clean_df["molecule_id"].to_numpy().astype(str)
-    return _pool_molecule_predictions(all_fp_arr, all_elem_arr, mol_ids)
+    counts_col = np.maximum(counts, 1.0)[:, None]
+    return (fp_sum / counts_col).astype(np.float16), (elem_sum / counts_col).astype(np.float32), unique_mols.tolist()
 '''
 
 
@@ -287,7 +277,7 @@ def add_module_cells(source: str, filename: str = "spec2fp.py"):
     for node in tree.body:
         segment = lines[previous:node.end_lineno]
         previous = node.end_lineno
-        if len(current) + len(segment) > 50:
+        if len(current) + len(segment) > 48:
             if current:
                 chunks.append("\n".join(current).strip())
             current = segment
@@ -296,7 +286,7 @@ def add_module_cells(source: str, filename: str = "spec2fp.py"):
     if current:
         chunks.append("\n".join(current).strip())
     for i, chunk in enumerate(chunks):
-        if len(chunk.splitlines()) > 58:
+        if len(chunk.splitlines()) > 57:
             raise ValueError(f"Module block exceeds cell limit: {len(chunk.splitlines())} lines\n{chunk[:100]}")
         ast.parse(chunk)
         magic = f"%%writefile /kaggle/working/{filename}" if i == 0 else f"%%writefile -a /kaggle/working/{filename}"
@@ -547,11 +537,13 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
         on="molecule_id", how="left"
     )
     assert train_df["split3"].notna().all(), "Not all train spectra matched to split3!"
+    del splits_df
+    gc.collect()
     print(f"Split3 counts (spectra):\n{train_df['split3'].value_counts()}")
     print(f"Split3 counts (molecules):\n{train_df.groupby('split3')['molecule_id'].nunique()}")
     """)
 
-    # ── 6. Targets Calculation ────────────────────────────────────────────
+    # ── 6. Targets Calculation ────────────────────────────────────
     md("## 6. Precompute Multi-Task Targets")
     code(r"""
     train_mols = train_df.drop_duplicates("molecule_id")[["molecule_id", "smiles"]].copy()
@@ -593,16 +585,19 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     """)
 
     code(r"""
-    morgan_arr = np.stack(morgan_fps).astype(np.float32)
-    maccs_arr = np.stack(maccs_fps).astype(np.float32)
+    morgan_arr = np.stack(morgan_fps).astype(np.uint8)
+    maccs_arr = np.stack(maccs_fps).astype(np.uint8)
     heavy_arr = np.array(heavy_atoms, dtype=np.float32)
     ring_arr = np.array(ring_counts, dtype=np.float32)
-    epres_arr = np.stack(elem_presence)
-    ecount_arr = np.stack(elem_counts)
-    mol_id_to_idx = {mid: i for i, mid in enumerate(train_mols["molecule_id"])}
+    epres_arr = np.stack(elem_presence).astype(np.float32)
+    ecount_arr = np.stack(elem_counts).astype(np.float32)
+    mol_id_to_idx = {str(mid): i for i, mid in enumerate(train_mols["molecule_id"])}
 
-    print(f"Targets computed: Morgan={morgan_arr.shape}, MACCS={maccs_arr.shape}, failures={fail_count}")
-    pos_freq = morgan_arr.mean(axis=0)
+    del morgan_fps, maccs_fps, heavy_atoms, ring_counts, elem_presence, elem_counts, train_mols
+    gc.collect()
+
+    print(f"Targets: Morgan={morgan_arr.shape} ({morgan_arr.dtype}), MACCS={maccs_arr.shape}, fails={fail_count}")
+    pos_freq = morgan_arr.mean(axis=0, dtype=np.float64)
     neg_freq = 1.0 - pos_freq
     pos_weight = np.clip(neg_freq / (pos_freq + 1e-6), 0.1, 50.0).astype(np.float32)
     print(f"BCE pos_weight: min={pos_weight.min():.2f}, max={pos_weight.max():.2f}, mean={pos_weight.mean():.2f}")
@@ -614,43 +609,54 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     class SpecFPDataset(Dataset):
         def __init__(self, df, mol_id_to_idx, morgan_arr, maccs_arr, heavy_arr,
                      ring_arr, epres_arr, ecount_arr, cfg, augment=False):
-            self.df = df.reset_index(drop=True)
-            self.mol_map = mol_id_to_idx
+            self.cfg = cfg
+            self.augment = augment
             self.morgan = morgan_arr
             self.maccs = maccs_arr
             self.heavy = heavy_arr
             self.ring = ring_arr
             self.epres = epres_arr
             self.ecount = ecount_arr
-            self.cfg = cfg
-            self.augment = augment
-            self.mol_groups = defaultdict(list)
-            for i, mid in enumerate(self.df["molecule_id"]):
-                self.mol_groups[str(mid)].append(i)
+
+            self.mzs = df["mz"].to_numpy()
+            self.intens = df["inten"].to_numpy()
+            self.prec_mzs = df["precursor_mz"].to_numpy(dtype=np.float32)
+            self.ces = pd.to_numeric(df["ce"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+            adduct_col = df["adduct"] if "adduct" in df.columns else ["[M+H]+"] * len(df)
+            self.adduct_idxs = np.array([spec2fp.ADDUCT2IDX.get(str(x).strip(), spec2fp.ADDUCT2IDX["<unk>"]) for x in adduct_col], dtype=np.int64)
+            inst_col = df["instrument"] if "instrument" in df.columns else ["unknown"] * len(df)
+            self.inst_idxs = np.array([spec2fp.INST2IDX.get(str(x).strip(), spec2fp.INST2IDX["<unk>"]) for x in inst_col], dtype=np.int64)
+            pol_col = df["polarity"] if "polarity" in df.columns else ["positive"] * len(df)
+            self.pol_idxs = np.array([spec2fp.POLARITY2IDX.get(str(x).strip().lower(), spec2fp.POLARITY2IDX["<unk>"]) for x in pol_col], dtype=np.int64)
+            self.target_idxs = np.array([mol_id_to_idx.get(str(m), 0) for m in df["molecule_id"]], dtype=np.int32)
+
+            if self.augment:
+                self.order = np.argsort(self.target_idxs).astype(np.int32)
+                sorted_targets = self.target_idxs[self.order]
+                self.bounds = np.searchsorted(sorted_targets, np.arange(len(morgan_arr) + 1)).astype(np.int32)
 
         def __len__(self):
-            return len(self.df)
+            return len(self.target_idxs)
     """)
 
     code(r"""
     def spec_getitem(self, idx):
-        row = self.df.iloc[idx]
-        mz = spec2fp.parse_peak_array(row["mz"])
-        inten = spec2fp.parse_peak_array(row["inten"])
-        prec_mz = float(row["precursor_mz"])
-        adduct = str(row.get("adduct", "[M+H]+"))
-        ce = float(row.get("ce", 0.0)) if pd.notna(row.get("ce", None)) else 0.0
-        inst = str(row.get("instrument", "unknown"))
-        pol = str(row.get("polarity", "positive"))
+        mz = spec2fp.parse_peak_array(self.mzs[idx])
+        inten = spec2fp.parse_peak_array(self.intens[idx])
+        prec_mz = float(self.prec_mzs[idx])
+        adduct_idx = int(self.adduct_idxs[idx])
+        ce = float(self.ces[idx])
+        inst_idx = int(self.inst_idxs[idx])
+        pol_idx = int(self.pol_idxs[idx])
+        tidx = int(self.target_idxs[idx])
 
         if self.augment:
-            mid = str(row["molecule_id"])
-            peer_indices = self.mol_groups.get(mid, [])
-            if len(peer_indices) > 1 and np.random.rand() < 0.3:
-                other_idx = np.random.choice(peer_indices)
-                other_row = self.df.iloc[other_idx]
-                mz2 = spec2fp.parse_peak_array(other_row["mz"])
-                int2 = spec2fp.parse_peak_array(other_row["inten"])
+            b_start = int(self.bounds[tidx])
+            b_end = int(self.bounds[tidx + 1])
+            if (b_end - b_start) > 1 and np.random.rand() < 0.3:
+                other_idx = int(self.order[np.random.randint(b_start, b_end)])
+                mz2 = spec2fp.parse_peak_array(self.mzs[other_idx])
+                int2 = spec2fp.parse_peak_array(self.intens[other_idx])
                 if len(mz2) > 0 and len(int2) > 0:
                     mz = np.concatenate([mz, mz2])
                     inten = np.concatenate([inten, int2])
@@ -663,9 +669,8 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
                 mz = mz + np.random.randn(len(mz)) * self.cfg.AUG_MZ_JITTER
 
         item = spec2fp.tensorize_spectrum(
-            mz, inten, prec_mz, adduct, ce, inst, pol,
+            mz, inten, prec_mz, adduct_idx, ce, inst_idx, pol_idx,
             top_k=self.cfg.TOP_K_PEAKS, mz_dim=self.cfg.MZ_DIM)
-        tidx = self.mol_map.get(str(row["molecule_id"]), 0)
         item["morgan_fp"] = self.morgan[tidx]
         item["maccs_fp"] = self.maccs[tidx]
         item["heavy_atoms"] = float(self.heavy[tidx])
@@ -706,12 +711,12 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
             polarities[i] = item["pol_idx"]
             ces[i] = float(item["ce_val"])
             prec_mzs[i] = float(item["prec_mz"])
-            morgan_t[i] = torch.from_numpy(item["morgan_fp"])
-            maccs_t[i] = torch.from_numpy(item["maccs_fp"])
+            morgan_t[i] = torch.from_numpy(item["morgan_fp"]).to(torch.float32)
+            maccs_t[i] = torch.from_numpy(item["maccs_fp"]).to(torch.float32)
             heavy_t[i] = float(item["heavy_atoms"])
             ring_t[i] = float(item["ring_count"])
-            epres_t[i] = torch.from_numpy(item["elem_presence"])
-            ecount_t[i] = torch.from_numpy(item["elem_count"])
+            epres_t[i] = torch.from_numpy(item["elem_presence"]).to(torch.float32)
+            ecount_t[i] = torch.from_numpy(item["elem_count"]).to(torch.float32)
 
         return {
             "peaks": peaks, "pad_mask": mask,
@@ -784,20 +789,28 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     train_split = train_df[train_df["split3"] == "train"].reset_index(drop=True)
     val_model_split = train_df[train_df["split3"] == "val_model"].reset_index(drop=True)
     val_rank_split = train_df[train_df["split3"] == "val_rank"].reset_index(drop=True)
+    del train_df
+    gc.collect()
+
+    train_mols_unique = train_split["molecule_id"].unique()
+    train_ref_target_idxs = np.array([mol_id_to_idx[str(m)] for m in train_mols_unique], dtype=np.int32)
+    train_ref_masses = train_split.groupby("molecule_id")["neutral_mass"].first().loc[train_mols_unique].to_numpy(dtype=np.float32)
 
     ds_train = SpecFPDataset(train_split, mol_id_to_idx, morgan_arr, maccs_arr,
                              heavy_arr, ring_arr, epres_arr, ecount_arr, cfg, augment=True)
+    del train_split
+    gc.collect()
+
     ds_val = SpecFPDataset(val_model_split, mol_id_to_idx, morgan_arr, maccs_arr,
                            heavy_arr, ring_arr, epres_arr, ecount_arr, cfg, augment=False)
 
-    nw = min(2, os.cpu_count() or 1) if not cfg.SMOKE_TEST else 0
     dl_train = DataLoader(ds_train, batch_size=cfg.BATCH_SIZE, shuffle=True,
-                          num_workers=nw, pin_memory=True, persistent_workers=nw > 0,
+                          num_workers=0, pin_memory=True,
                           collate_fn=collate_train_batch, drop_last=len(ds_train) > cfg.BATCH_SIZE)
     dl_val = DataLoader(ds_val, batch_size=cfg.BATCH_SIZE, shuffle=False,
-                        num_workers=nw, pin_memory=True, persistent_workers=nw > 0,
+                        num_workers=0, pin_memory=True,
                         collate_fn=collate_train_batch)
-    print(f"DataLoaders ready: train={len(dl_train)} batches, val={len(dl_val)} batches")
+    print(f"DataLoaders ready: train={len(dl_train)} batches, val={len(dl_val)} batches (num_workers=0, zero CoW)")
     """)
 
     code(r"""
@@ -844,7 +857,8 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
         raw_model = model.module if hasattr(model, "module") else model
         raw_model.eval()
         total_loss, n_batches = 0.0, 0
-        all_pred, all_true = [], []
+        cos_sum, cos_cnt = 0.0, 0
+        tan_sum, tan_cnt = 0.0, 0
         dev_type = "cuda" if "cuda" in str(DEVICE) else "cpu"
         for batch in dl:
             b_dev = {k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
@@ -855,55 +869,65 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
             loss, _ = compute_loss(out, batch, pw_tensor)
             total_loss += loss.item()
             n_batches += 1
-            all_pred.append(torch.sigmoid(out["fp_logits"]).float().cpu())
-            all_true.append(batch["morgan_fp"])
 
-        pred_fp = torch.cat(all_pred, dim=0).numpy()
-        true_fp = torch.cat(all_true, dim=0).numpy()
-        cos_sims = []
-        for i in range(len(pred_fp)):
-            n1, n2 = np.linalg.norm(pred_fp[i]), np.linalg.norm(true_fp[i])
-            if n1 > 0 and n2 > 0:
-                cos_sims.append(np.dot(pred_fp[i], true_fp[i]) / (n1 * n2))
-        pred_bin = (pred_fp > 0.5).astype(np.float32)
-        tanims = []
-        for i in range(len(pred_bin)):
-            inter = (pred_bin[i] * true_fp[i]).sum()
-            union = pred_bin[i].sum() + true_fp[i].sum() - inter
-            tanims.append(inter / max(union, 1))
-        return total_loss / max(n_batches, 1), np.mean(cos_sims) if cos_sims else 0.0, np.mean(tanims) if tanims else 0.0
+            pred_prob = torch.sigmoid(out["fp_logits"]).float()
+            true_fp = batch["morgan_fp"].to(DEVICE)
+            dot = (pred_prob * true_fp).sum(dim=1)
+            norms = torch.norm(pred_prob, dim=1) * torch.norm(true_fp, dim=1)
+            valid = norms > 0
+            if valid.any():
+                cos_sum += (dot[valid] / norms[valid]).sum().item()
+                cos_cnt += int(valid.sum().item())
+            pred_bin = (pred_prob > 0.5).float()
+            inter = (pred_bin * true_fp).sum(dim=1)
+            union = pred_bin.sum(dim=1) + true_fp.sum(dim=1) - inter
+            tan_sum += (inter / torch.clamp(union, min=1.0)).sum().item()
+            tan_cnt += len(pred_bin)
+
+        mean_loss = total_loss / max(n_batches, 1)
+        mean_cos = cos_sum / max(cos_cnt, 1)
+        mean_tan = tan_sum / max(tan_cnt, 1)
+        return mean_loss, mean_cos, mean_tan
     """)
 
     # ── 10. Training Helpers & Epochs ─────────────────────────────────────
     md("## 10. Proxy MRR Retrieval & Epoch Execution")
     code(r"""
-    train_mols_unique = train_split["molecule_id"].unique()
-    train_ref_fps = np.stack([morgan_arr[mol_id_to_idx[m]] for m in train_mols_unique])
-    train_ref_masses = train_split.groupby("molecule_id")["neutral_mass"].first().loc[train_mols_unique].to_numpy()
+    print(f"Zero-copy reference index: {len(train_ref_target_idxs):,} molecules, {train_ref_target_idxs.nbytes / 1e6:.2f} MB")
+    """)
 
+    code(r"""
     @torch.no_grad()
-    def compute_val_proxy_mrr(model, val_split):
+    def compute_val_proxy_mrr(model, val_split, max_eval_mols=None):
         raw_model = model.module if hasattr(model, "module") else model
         raw_model.eval()
+        eval_df = val_split
+        if max_eval_mols is not None:
+            u_mols = val_split["molecule_id"].unique()
+            if len(u_mols) > max_eval_mols:
+                rng = np.random.RandomState(42)
+                sel_mols = set(rng.choice(u_mols, size=max_eval_mols, replace=False))
+                eval_df = val_split[val_split["molecule_id"].isin(sel_mols)].reset_index(drop=True)
         fp_probs, _, mol_ids = spec2fp.predict(
-            raw_model, val_split, device=DEVICE, batch_size=cfg.PRED_BATCH_SIZE,
+            raw_model, eval_df, device=DEVICE, batch_size=cfg.PRED_BATCH_SIZE,
             top_k=cfg.TOP_K_PEAKS, mz_dim=cfg.MZ_DIM)
-        val_mass_map = val_split.groupby("molecule_id")["neutral_mass"].first().to_dict()
+        val_mass_map = eval_df.groupby("molecule_id")["neutral_mass"].first().to_dict()
         rrs, top1_hits, top25_hits = [], 0, 0
         for i, mid in enumerate(mol_ids):
             q_fp = fp_probs[i].astype(np.float32)
             t_idx = mol_id_to_idx.get(str(mid))
             if t_idx is None:
                 continue
-            true_fp = morgan_arr[t_idx]
-            q_mass = val_mass_map.get(mid, 0.0)
+            true_fp = morgan_arr[t_idx].astype(np.float32)
+            q_mass = float(val_mass_map.get(mid, 0.0))
             mass_diff = np.abs(train_ref_masses - q_mass)
             cand_mask = (mass_diff <= (50.0 * 1e-6 * max(q_mass, 1.0)))
             if cand_mask.sum() < 25:
                 cand_idx = np.argsort(mass_diff)[:min(len(mass_diff), 50)]
             else:
                 cand_idx = np.where(cand_mask)[0]
-            cand_fps = np.vstack([train_ref_fps[cand_idx], true_fp[None, :]])
+            cand_t_idxs = train_ref_target_idxs[cand_idx]
+            cand_fps = np.vstack([morgan_arr[cand_t_idxs].astype(np.float32), true_fp[None, :]])
             norms = np.linalg.norm(cand_fps, axis=1) * max(np.linalg.norm(q_fp), 1e-8)
             cos_scores = (cand_fps @ q_fp) / np.maximum(norms, 1e-8)
             true_score = cos_scores[-1]
@@ -961,7 +985,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
         epoch_times.append(ep_time)
         ema.apply_shadow(model)
         v_loss, v_cos, v_tan = evaluate_val_sim(model, dl_val, pw_tensor)
-        v_mrr, v_top1, v_top25 = compute_val_proxy_mrr(model, val_model_split)
+        v_mrr, v_top1, v_top25 = compute_val_proxy_mrr(model, val_model_split, max_eval_mols=3000)
         ema.restore(model)
 
         cur_lr = optimizer.param_groups[0]["lr"]
@@ -1030,7 +1054,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     fp_vm, elem_vm, ids_vm = generate_and_save_split(val_model_split, "val_model")
     fp_vr, elem_vr, ids_vr = generate_and_save_split(val_rank_split, "val_rank")
     fp_te, elem_te, ids_te = generate_and_save_split(test_df, "test")
-    del fp_vm, fp_vr, fp_te; gc.collect()
+    del fp_vm, fp_vr, fp_te, elem_vm, elem_vr, elem_te; gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     """)
@@ -1039,7 +1063,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     md("## 14. Validation Metrics & Diagnostic Curves")
     code(r"""
     final_v_loss, final_v_cos, final_v_tan = evaluate_val_sim(model, dl_val, pw_tensor)
-    final_v_mrr, final_v_top1, final_v_top25 = compute_val_proxy_mrr(model, val_model_split)
+    final_v_mrr, final_v_top1, final_v_top25 = compute_val_proxy_mrr(model, val_model_split, max_eval_mols=None)
 
     val_metrics = {
         "val_loss": float(final_v_loss),
@@ -1081,12 +1105,15 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     md("## 15. Optional Full Dataset Retraining")
     code(r"""
     if cfg.FULL_TRAIN:
-        print(f"FULL_TRAIN=True: Retraining on all train molecules for {best_epoch} epochs...")
-        ds_full = SpecFPDataset(train_df.reset_index(drop=True), mol_id_to_idx,
+        print(f"FULL_TRAIN=True: Reloading train data from {train_path} for {best_epoch} epochs...")
+        full_train_df = pd.read_parquet(train_path).reset_index(drop=True)
+        ds_full = SpecFPDataset(full_train_df, mol_id_to_idx,
                                 morgan_arr, maccs_arr, heavy_arr, ring_arr,
                                 epres_arr, ecount_arr, cfg, augment=True)
+        del full_train_df; gc.collect()
         dl_full = DataLoader(ds_full, batch_size=cfg.BATCH_SIZE, shuffle=True,
-                             num_workers=nw, pin_memory=True, collate_fn=collate_train_batch)
+                             num_workers=0, pin_memory=True, persistent_workers=False,
+                             collate_fn=collate_train_batch)
         full_base = spec2fp.Spec2FPModel(model_cfg).to(DEVICE)
         full_model = nn.DataParallel(full_base) if N_GPU > 1 else full_base
         opt_f = torch.optim.AdamW(full_model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
@@ -1099,7 +1126,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
         torch.save({"ema_state_dict": ema_f.state_dict(), "epoch": best_epoch, "mode": "full_train"},
                    root / "spec2fp_model_full.pt")
         print("Full training model checkpoint saved as spec2fp_model_full.pt")
-        del full_model, full_base, opt_f, sch_f, scl_f, ema_f; gc.collect()
+        del full_model, full_base, opt_f, sch_f, scl_f, ema_f, ds_full, dl_full; gc.collect()
     else:
         print("FULL_TRAIN=False. Preserving default split3 train-only model (fold0) for stage 09 consistency.")
     """)
@@ -1108,8 +1135,9 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     md("## 16. Manifest Contract & Sanity Verifications")
     code(r"""
     elapsed = time.perf_counter() - T_START
-    heldout_ids = sorted(set(val_model_split["molecule_id"]).union(set(val_rank_split["molecule_id"])))
-    heldout_hash = hashlib.sha256("".join(heldout_ids).encode()).hexdigest()
+    vm_ids = val_model_split["molecule_id"].unique().tolist()
+    vr_ids = val_rank_split["molecule_id"].unique().tolist()
+    heldout_hash = hashlib.sha256("".join(sorted(vm_ids + vr_ids)).encode()).hexdigest()
 
     manifest = {
         "stage": "spec2fp",
