@@ -79,8 +79,11 @@ def parse_peak_array(val: Any) -> np.ndarray:
 
 
 def sinusoidal_embed(values: np.ndarray, dim: int = 64) -> np.ndarray:
-    """Sinusoidal positional encoding for m/z values. Shape: (N, dim)."""
-    freqs = np.exp(np.arange(0, dim, 2, dtype=np.float32) * -(math.log(10000.0) / dim))
+    """Multi-scale sinusoidal encoding resolving 0.005 Da mass defects up to 2000 Da."""
+    freqs = np.logspace(
+        math.log10(2 * math.pi / 2000.0),
+        math.log10(2 * math.pi / 0.005),
+        dim // 2, dtype=np.float32)
     angles = np.outer(values.astype(np.float32), freqs)
     return np.concatenate([np.sin(angles), np.cos(angles)], axis=-1)
 
@@ -192,7 +195,10 @@ class Spec2FPModel(nn.Module):
         cls_meta_mask = torch.zeros(B, 3, dtype=torch.bool, device=pad_mask.device)
         full_mask = torch.cat([cls_meta_mask, pad_mask], dim=1)
         x = self.encoder(x, src_key_padding_mask=full_mask)
-        x = self.norm(x[:, 0])
+        cls_out = x[:, 0]
+        valid_tok = (~full_mask).float().unsqueeze(-1)
+        mean_out = (x * valid_tok).sum(dim=1) / valid_tok.sum(dim=1).clamp(min=1.0)
+        x = self.norm(cls_out + mean_out)
         return {
             "fp_logits": self.fp_head(x), "maccs_logits": self.maccs_head(x),
             "heavy_atoms": self.heavy_atom_head(x).squeeze(-1),
@@ -214,15 +220,23 @@ def load_model(config_path: str, weights_path: str, device: str = "cpu"):
         model.load_state_dict(sd["model_state_dict"])
     else:
         model.load_state_dict(sd)
+    pw_path = Path(weights_path).parent / "spec2fp_pos_weights.npy"
+    if pw_path.is_file():
+        try:
+            model.pos_weights = np.load(pw_path)
+        except Exception:
+            pass
     model.eval()
     return model.to(device), cfg
 
 
 @torch.no_grad()
-def predict(model, clean_df, device="cuda", batch_size=128, top_k=128, mz_dim=64):
+def predict(model, clean_df, device="cuda", batch_size=128, top_k=128, mz_dim=64, pos_weights=None):
     """Predict fingerprints + element info with streaming molecule-level pooling."""
     raw_model = model.module if hasattr(model, "module") else model
     raw_model.eval()
+    pw = pos_weights if pos_weights is not None else getattr(raw_model, "pos_weights", None)
+    pw_shift = 0.5 * torch.log(torch.as_tensor(pw, device=device, dtype=torch.float32).clamp(min=1.0)) if pw is not None else None
     feat_dim, n_rows = 2 * mz_dim + 1, len(clean_df)
     if n_rows == 0:
         return (np.zeros((0, 4096), dtype=np.float16), np.zeros((0, N_ELEMENTS), dtype=np.float32), [])
@@ -256,7 +270,8 @@ def predict(model, clean_df, device="cuda", batch_size=128, top_k=128, mz_dim=64
         bd = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in bd.items()}
         with torch.amp.autocast(device_type=dev_type, dtype=torch.float16, enabled=is_cuda):
             out = raw_model(**bd)
-        batch_fp = torch.sigmoid(out["fp_logits"]).float().cpu().numpy()
+        fp_logits = out["fp_logits"] - pw_shift if pw_shift is not None else out["fp_logits"]
+        batch_fp = torch.sigmoid(fp_logits).float().cpu().numpy()
         batch_elem = out["elem_count"].float().cpu().numpy()
         batch_inv = inv_indices[s_idx:e_idx]
         np.add.at(fp_sum, batch_inv, batch_fp)
@@ -313,7 +328,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     **Outputs**: `spec2fp_model.pt`, `spec2fp_config.json`, predicted FP arrays,
     element predictions, validation metrics, `spec2fp.py` module, `manifest.json`.
 
-    **Runtime**: ~5 h on 2× T4; SMOKE_TEST ≈ 3 min CPU.
+    **Runtime**: ~6.5 h on 2× T4 (14 epochs); SMOKE_TEST ≈ 3 min CPU.
     **GPU RAM**: ~6–8 GB per T4 with fp16 autocast, batch 256 on DataParallel.
     """)
 
@@ -353,7 +368,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
         GRAD_CLIP: float = 1.0
         BATCH_SIZE: int = 256
         PRED_BATCH_SIZE: int = 128
-        TRAIN_BUDGET_H: float = 5.0
+        TRAIN_BUDGET_H: float = 6.5
         WARMUP_FRAC: float = 0.05
         EMA_DECAY: float = 0.999
         PATIENCE: int = 8
@@ -364,7 +379,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
         OUTPUT_DIR: str = "/kaggle/working/artifacts/spec2fp"
         TEST_MODEL: str = "fold0"
         FULL_TRAIN: bool = False
-        time_budget_s: float = 5.0 * 3600
+        time_budget_s: float = 6.5 * 3600
         SUBMIT_BUDGET_S: float = 8.0 * 3600
     """)
 
@@ -599,8 +614,8 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     print(f"Targets: Morgan={morgan_arr.shape} ({morgan_arr.dtype}), MACCS={maccs_arr.shape}, fails={fail_count}")
     pos_freq = morgan_arr.mean(axis=0, dtype=np.float64)
     neg_freq = 1.0 - pos_freq
-    pos_weight = np.clip(neg_freq / (pos_freq + 1e-6), 0.1, 50.0).astype(np.float32)
-    print(f"BCE pos_weight: min={pos_weight.min():.2f}, max={pos_weight.max():.2f}, mean={pos_weight.mean():.2f}")
+    pos_weight = np.clip(np.sqrt(neg_freq / (pos_freq + 1e-6)), 1.0, 10.0).astype(np.float32)
+    print(f"BCE pos_weight (sqrt dampened): min={pos_weight.min():.2f}, max={pos_weight.max():.2f}, mean={pos_weight.mean():.2f}")
     """)
 
     # ── 7. Dataset & Augmentation ─────────────────────────────────────────
@@ -817,7 +832,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
     steps_per_epoch = max(len(dl_train), 1)
     budget_s = cfg.TRAIN_BUDGET_H * 3600
-    est_s_per_step = 0.12
+    est_s_per_step = 0.202
     max_epochs = max(int(budget_s / (est_s_per_step * steps_per_epoch)), 4)
     total_steps = max_epochs * steps_per_epoch
     warmup_steps = int(total_steps * cfg.WARMUP_FRAC)
@@ -837,11 +852,13 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
 
     code(r"""
     def compute_loss(out, batch, pw_tensor):
+        morgan_smooth = batch["morgan_fp"].to(DEVICE) * 0.995 + 0.0025
+        maccs_smooth = batch["maccs_fp"].to(DEVICE) * 0.995 + 0.0025
         fp_loss = F.binary_cross_entropy_with_logits(
-            out["fp_logits"], batch["morgan_fp"].to(DEVICE),
+            out["fp_logits"], morgan_smooth,
             pos_weight=pw_tensor, reduction="mean")
         maccs_loss = F.binary_cross_entropy_with_logits(
-            out["maccs_logits"], batch["maccs_fp"].to(DEVICE), reduction="mean")
+            out["maccs_logits"], maccs_smooth, reduction="mean")
         heavy_loss = F.smooth_l1_loss(out["heavy_atoms"], batch["heavy_atoms"].to(DEVICE))
         ring_loss = F.smooth_l1_loss(out["ring_count"], batch["ring_count"].to(DEVICE))
         epres_loss = F.binary_cross_entropy_with_logits(
@@ -870,7 +887,11 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
             total_loss += loss.item()
             n_batches += 1
 
-            pred_prob = torch.sigmoid(out["fp_logits"]).float()
+            if pw_tensor is not None:
+                cal_logits = out["fp_logits"] - 0.5 * torch.log(pw_tensor.clamp(min=1.0))
+                pred_prob = torch.sigmoid(cal_logits).float()
+            else:
+                pred_prob = torch.sigmoid(out["fp_logits"]).float()
             true_fp = batch["morgan_fp"].to(DEVICE)
             dot = (pred_prob * true_fp).sum(dim=1)
             norms = torch.norm(pred_prob, dim=1) * torch.norm(true_fp, dim=1)
@@ -910,7 +931,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
                 eval_df = val_split[val_split["molecule_id"].isin(sel_mols)].reset_index(drop=True)
         fp_probs, _, mol_ids = spec2fp.predict(
             raw_model, eval_df, device=DEVICE, batch_size=cfg.PRED_BATCH_SIZE,
-            top_k=cfg.TOP_K_PEAKS, mz_dim=cfg.MZ_DIM)
+            top_k=cfg.TOP_K_PEAKS, mz_dim=cfg.MZ_DIM, pos_weights=pw_tensor)
         val_mass_map = eval_df.groupby("molecule_id")["neutral_mass"].first().to_dict()
         rrs, top1_hits, top25_hits = [], 0, 0
         for i, mid in enumerate(mol_ids):
@@ -1042,7 +1063,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     def generate_and_save_split(split_df, split_name):
         fp_probs, elem_pred, mol_ids = spec2fp.predict(
             raw_eval_model, split_df, device=DEVICE, batch_size=cfg.PRED_BATCH_SIZE,
-            top_k=cfg.TOP_K_PEAKS, mz_dim=cfg.MZ_DIM)
+            top_k=cfg.TOP_K_PEAKS, mz_dim=cfg.MZ_DIM, pos_weights=pos_weight)
         np.save(root / f"fp_pred_{split_name}.npy", fp_probs)
         np.save(root / f"elem_pred_{split_name}.npy", elem_pred)
         pd.DataFrame({"molecule_id": mol_ids}).to_parquet(root / f"fp_pred_ids_{split_name}.parquet")
