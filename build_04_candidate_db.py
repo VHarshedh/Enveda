@@ -63,6 +63,8 @@ DB_COLUMNS = ["row_id", "ik14", "smiles", "formula", "mass",
               "source_mask", "fast_key", "identity_kind"]
 CTX = None
 EK = None
+_MEM_IK14_CACHE = OrderedDict()
+_MEM_FP_CACHE = OrderedDict()
 
 
 def find_file(filename, hint="", required=True, roots=None):
@@ -388,33 +390,35 @@ def ingest_metadata(db, path, kind, cfg, schema=None):
     columns = [v for k, v in adapter.mapping.items() if k not in ("smiles", "split3")]
     if kind == "train":
         columns.append(adapter.mapping["smiles"])
-    for batch in tqdm(file.iter_batches(cfg.BATCH_ROWS, columns=columns), desc=f"{kind} metadata"):
-        frame = adapter.adapt(batch)
-        if frame.molecule_id.isna().any():
-            raise ValueError(f"Null molecule_id in {path}")
-        frame["id"] = frame.molecule_id.astype(str)
-        frame["mass"] = observed_mass(frame)
-        frame["smiles"] = frame.smiles.fillna("").astype(str) if kind == "train" else ""
-        groups = frame.groupby("id", sort=False)
-        conflict_in_batch = (groups.smiles.nunique() > 1).sum()
-        if conflict_in_batch > 0:
-            print(f"Warning: {conflict_in_batch} molecule IDs have conflicting SMILES within batch; retaining first")
-        grouped = groups.agg(smiles=("smiles", "first"), mass_sum=("mass", "sum"),
-                             n=("mass", "size"), lo=("mass", "min"), hi=("mass", "max"))
-        rows = list(grouped.reset_index().itertuples(index=False, name=None))
-        db.execute("CREATE TEMP TABLE incoming(id TEXT, smiles TEXT, mass_sum REAL, n INT, lo REAL, hi REAL)")
-        db.executemany("INSERT INTO incoming VALUES (?,?,?,?,?,?)", rows)
-        conflict = db.execute(f"SELECT COUNT(*) FROM incoming i JOIN {table} t USING(id) "
-                              "WHERE i.smiles != t.smiles").fetchone()[0]
-        if conflict:
-            print(f"Warning: {conflict} molecule IDs have conflicting SMILES across batches; retaining initial in {table}")
-        db.execute(f"INSERT INTO {table} (id, smiles, mass_sum, n, lo, hi) "
-                   f"SELECT id, smiles, mass_sum, n, lo, hi FROM incoming WHERE 1 "
-                   f"ON CONFLICT(id) DO UPDATE SET mass_sum={table}.mass_sum+excluded.mass_sum, "
-                   f"n={table}.n+excluded.n, lo=min({table}.lo,excluded.lo), hi=max({table}.hi,excluded.hi)")
-        db.execute("DROP TABLE incoming")
-        db.commit()
-        resource_guard(cfg)
+    table_arrow = file.read(columns=columns)
+    frame = adapter.adapt(table_arrow)
+    if frame.molecule_id.isna().any():
+        raise ValueError(f"Null molecule_id in {path}")
+    frame["id"] = frame.molecule_id.astype(str)
+    frame["mass"] = observed_mass(frame)
+    if kind == "train":
+        frame["smiles"] = frame.smiles.fillna("").astype(str)
+        valid = frame[frame.smiles != ""]
+        if not valid.empty:
+            counts = valid.groupby(["id", "smiles"], sort=False).size().reset_index(name="c")
+            consensus = counts.sort_values(["id", "c"], ascending=[True, False]).drop_duplicates(subset=["id"])
+            smi_map = consensus.set_index("id")["smiles"]
+        else:
+            smi_map = pd.Series(dtype=str)
+    groups = frame.groupby("id", sort=False)
+    grouped = groups.agg(mass_median=("mass", "median"),
+                         n=("mass", "size"), lo=("mass", "min"), hi=("mass", "max"))
+    # Trick SQLite: Store (median * n) so that SQL 'mass_sum / n' perfectly yields the median
+    grouped["mass_sum"] = grouped["mass_median"] * grouped["n"]
+    if kind == "train":
+        grouped["smiles"] = smi_map.reindex(grouped.index).fillna(groups["smiles"].first()).fillna("")
+    else:
+        grouped["smiles"] = ""
+    rows = list(grouped.reset_index()[["id", "smiles", "mass_sum", "n", "lo", "hi"]].itertuples(index=False, name=None))
+    db.executemany(f"INSERT INTO {table} (id, smiles, mass_sum, n, lo, hi) VALUES (?,?,?,?,?,?) "
+                   f"ON CONFLICT(id) DO NOTHING", rows)
+    db.commit()
+    resource_guard(cfg)
     state_set(db, f"metadata_{kind}", True)
 
 
@@ -663,7 +667,12 @@ def discover_sources(root, core_paths):
         specs = probed if isinstance(probed, list) else [probed]
         for spec in specs:
             try:
-                spec["dataset"] = str(path.relative_to(root).parts[0])
+                parts = path.relative_to(root).parts
+                # Handle Kaggle's nested '/kaggle/input/datasets/user/dataset_slug/' paths
+                if parts[0] == "datasets" and len(parts) > 2:
+                    spec["dataset"] = parts[2]
+                else:
+                    spec["dataset"] = parts[0]
             except ValueError:
                 spec["dataset"] = path.stem
             if spec.get("is_zip") and spec.get("zip_member"):
@@ -1027,13 +1036,17 @@ def write_fingerprints(cfg, pool, n, width):
     return written
 
 
-def configure(db_dir=None, exclusion_scope="train", cache_dir=None, row_group_cache=2):
+def configure(db_dir=None, exclusion_scope="train", cache_dir=None, row_group_cache=2,
+              ik14_cache_size=100000, fp_cache_size=32768, cache_commit_rows=5000):
     global CTX
     if exclusion_scope not in ("train", "all"):
         raise ValueError("exclusion_scope must be 'train' or 'all'")
     if CTX:
+        flush_cache()
         CTX["index"].close()
         CTX["cache"].close()
+    _MEM_IK14_CACHE.clear()
+    _MEM_FP_CACHE.clear()
     root = Path(db_dir or WORK/"artifacts"/"candidates").resolve()
     metadata = json.loads((root/"db_metadata.json").read_text())
     if metadata["fp_spec"] != load_evalkit().FP_SPEC:
@@ -1041,13 +1054,19 @@ def configure(db_dir=None, exclusion_scope="train", cache_dir=None, row_group_ca
     cache_root = Path(cache_dir or WORK/"candidate_cache"/metadata["build_id"])
     cache_root.mkdir(parents=True, exist_ok=True)
     cache = open_sql(cache_root/"lazy.sqlite")
+    # Only the disposable inference cache changes durability; build DBs keep theirs.
+    cache.execute("PRAGMA journal_mode=WAL")
+    cache.execute("PRAGMA synchronous=NORMAL")
     cache.execute("CREATE TABLE IF NOT EXISTS chemistry(row_id INTEGER PRIMARY KEY, ik14 TEXT, fp BLOB)")
+    cache.commit()
     CTX = {"root": root, "meta": metadata, "mass": map_read(root/"mass.npy"),
            "order": map_read(root/"mass_sorted_idx.npy"), "formula_ids": map_read(root/"formula_row_ids.npy"),
            "offsets": map_read(root/"row_group_offsets.npy"), "fp": map_read(root/"fp_packed.npy"),
            "valid": map_read(root/"fp_valid.npy"), "index": open_sql(root/"index.sqlite", True),
            "parquet": pq.ParquetFile(root/"db.parquet"), "cache": cache,
-           "scope": exclusion_scope, "groups": OrderedDict(), "max_groups": max(1, row_group_cache)}
+           "scope": exclusion_scope, "groups": OrderedDict(), "max_groups": max(1, row_group_cache),
+           "ik14_cache_size": max(1, ik14_cache_size), "fp_cache_size": max(1, fp_cache_size),
+           "cache_commit_rows": max(1, cache_commit_rows), "cache_pending": 0}
     return metadata
 
 
@@ -1055,6 +1074,41 @@ def context():
     if CTX is None:
         configure()
     return CTX
+
+
+def flush_cache():
+    """Persist pending lazy chemistry at split boundaries or before reconfiguration."""
+    if CTX is not None and CTX["cache"].in_transaction:
+        CTX["cache"].commit()
+    if CTX is not None:
+        CTX["cache_pending"] = 0
+
+
+def cache_written(count):
+    state = context()
+    state["cache_pending"] = state.get("cache_pending", 0) + count
+    if state["cache_pending"] >= state.get("cache_commit_rows", 5000):
+        flush_cache()
+
+
+def memory_cache_put(cache, key, value, limit):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > limit:
+        cache.popitem(last=False)
+
+
+def prefetch_canonical_keys(row_ids):
+    """One batched SELECT for uncached IDs, including negative lookup caching."""
+    state = context()
+    ids = list(dict.fromkeys(int(i) for i in row_ids if int(i) not in _MEM_IK14_CACHE))
+    for chunk in batched(ids, 500):
+        placeholders = ','.join('?' for _ in chunk)
+        rows = dict(state["cache"].execute(
+            f"SELECT row_id,ik14 FROM chemistry WHERE row_id IN ({placeholders})", chunk))
+        for row_id in chunk:
+            memory_cache_put(_MEM_IK14_CACHE, row_id, rows.get(row_id),
+                             state.get("ik14_cache_size", 100000))
 
 
 def fetch_rows(ids):
@@ -1170,9 +1224,14 @@ def query_by_formula(formula, exclude_keys=None):
     return filter_sources(fetch_rows(context()["formula_ids"][lo:hi]), exclude_keys)
 
 
-def get_fingerprints(row_ids):
+def get_fingerprints(row_ids, smiles=None):
+    """Get packed bits, computing missing rows once in a batch using supplied SMILES."""
     state = context()
     ids = np.asarray(row_ids, dtype=np.int64)
+    if smiles is not None:
+        smiles = np.asarray(smiles, dtype=object)
+        if smiles.shape != ids.shape:
+            raise ValueError("smiles must align positionally with row_ids")
     if len(ids) == 0:
         return np.empty((0, state["meta"]["fp_bytes"]), dtype=np.uint8)
     if len(ids) > state["meta"]["max_materialized_rows"]:
@@ -1184,22 +1243,39 @@ def get_fingerprints(row_ids):
     out[ready] = state["fp"][ids[ready]]
     missing = np.flatnonzero(~ready)
     if len(missing) > 0:
-        missing_ids = ids[missing]
-        for position, row_id in zip(missing, missing_ids):
-            row_id = int(row_id)
-            cached = state["cache"].execute("SELECT fp FROM chemistry WHERE row_id=?", (row_id,)).fetchone()
-            if cached and cached[0] is not None:
-                out[position] = np.frombuffer(cached[0], dtype=np.uint8)
+        positions = {}
+        for position in missing:
+            positions.setdefault(int(ids[position]), []).append(int(position))
+        resolved, uncached = {}, []
+        for row_id in positions:
+            if row_id in _MEM_FP_CACHE:
+                resolved[row_id] = _MEM_FP_CACHE[row_id]
+                _MEM_FP_CACHE.move_to_end(row_id)
             else:
-                smiles = fetch_rows([row_id]).smiles.iloc[0]
-                packed = fingerprint_chunk([(row_id, smiles)])[0][1]
-                out[position] = packed
-                state["cache"].execute(
-                    "INSERT INTO chemistry(row_id,fp) VALUES (?,?) "
-                    "ON CONFLICT(row_id) DO UPDATE SET fp=excluded.fp",
-                    (row_id, packed.tobytes())
-                )
-        state["cache"].commit()
+                uncached.append(row_id)
+        for chunk in batched(uncached, 500):
+            placeholders = ','.join('?' for _ in chunk)
+            for row_id, blob in state["cache"].execute(
+                    f"SELECT row_id,fp FROM chemistry WHERE row_id IN ({placeholders})", chunk):
+                if blob is not None:
+                    resolved[int(row_id)] = np.frombuffer(blob, dtype=np.uint8)
+        to_compute = [row_id for row_id in uncached if row_id not in resolved]
+        if to_compute:
+            if smiles is None:
+                missing_smiles = fetch_rows(to_compute).smiles.to_numpy()
+            else:
+                missing_smiles = [smiles[positions[row_id][0]] for row_id in to_compute]
+            computed = fingerprint_chunk(list(zip(to_compute, missing_smiles)))
+            state["cache"].executemany(
+                "INSERT INTO chemistry(row_id,fp) VALUES (?,?) "
+                "ON CONFLICT(row_id) DO UPDATE SET fp=excluded.fp",
+                [(int(row_id), packed.tobytes()) for row_id, packed in computed])
+            resolved.update((int(row_id), packed) for row_id, packed in computed)
+            cache_written(len(computed))
+        for row_id, locations in positions.items():
+            packed = resolved[row_id]
+            out[locations] = packed
+            memory_cache_put(_MEM_FP_CACHE, row_id, packed, state.get("fp_cache_size", 32768))
     return out
 
 
@@ -1207,32 +1283,78 @@ def canonical_key(row_id, smiles, known=None):
     if isinstance(known, str) and known:
         return known
     state = context()
-    row = state["cache"].execute("SELECT ik14 FROM chemistry WHERE row_id=?", (int(row_id),)).fetchone()
-    if row and row[0]:
-        return row[0]
+    row_id = int(row_id)
+    if row_id not in _MEM_IK14_CACHE:
+        prefetch_canonical_keys([row_id])
+    key = _MEM_IK14_CACHE[row_id]
+    _MEM_IK14_CACHE.move_to_end(row_id)
+    if key:
+        return key
     key = load_evalkit().canon_ik14(Chem.MolFromSmiles(smiles))
     if not key:
         raise ValueError(f"evalkit.canon_ik14 failed at row {row_id}")
     state["cache"].execute("INSERT INTO chemistry(row_id,ik14) VALUES (?,?) "
                            "ON CONFLICT(row_id) DO UPDATE SET ik14=excluded.ik14", (int(row_id), key))
+    memory_cache_put(_MEM_IK14_CACHE, row_id, key, state.get("ik14_cache_size", 100000))
+    cache_written(1)
     return key
 
 
-def finalize_candidates(ranked, top_n=256, limit=25):
+def finalize_candidates(ranked, top_n=256, limit=25, canonical_limit=None):
+    """Deduplicate a shortlist; optionally canonicalize only its leading unique hits.
+
+    canonical_limit=25 preserves canonical top-25 submission identities and uses
+    fast_key deduplication for the remaining Stage 09 rows. Their canon_ik14 is
+    null, explicitly distinguishing unevaluated tautomers from canonical hits.
+    The default retains the full-canonical behavior for existing Stage 04 callers.
+    """
     if top_n < 1 or limit < 1:
         raise ValueError("top_n and limit must be positive")
     shortlist = ranked.head(top_n).copy()
+    if canonical_limit is not None and canonical_limit < 1:
+        raise ValueError("canonical_limit must be positive")
     merged = OrderedDict()
+    fast_seen = set()
+    canonical_count = 0
+    # Batching negative lookups removes per-row SQL, while bounded RAM caches
+    # absorb recurring row IDs from overlapping windows.
+    unknown = shortlist.loc[~shortlist.ik14.map(lambda k: isinstance(k, str) and bool(k)), 'row_id']
+    prefetch_canonical_keys(unknown)
     for row in shortlist.to_dict("records"):
-        key = canonical_key(row["row_id"], row["smiles"], row.get("ik14"))
+        if canonical_limit is not None and canonical_count >= canonical_limit:
+            fast = row['fast_key']
+            if fast in fast_seen:
+                continue
+            key = ('fast', fast)
+            row.update(ik14=fast, canon_ik14=None, identity_kind="fast_only")
+        else:
+            canonical = canonical_key(row["row_id"], row["smiles"], row.get("ik14"))
+            key = ('canonical', canonical)
+            row.update(ik14=canonical, identity_kind="canonical")
+            if canonical_limit is not None:
+                row['canon_ik14'] = canonical
+            if key not in merged:
+                canonical_count += 1
         if key not in merged:
-            row.update(ik14=key, identity_kind="canonical", member_row_ids=[int(row["row_id"])])
+            row.update(member_row_ids=[int(row["row_id"])])
             merged[key] = row
         else:
             merged[key]["source_mask"] |= int(row["source_mask"])
             merged[key]["member_row_ids"].append(int(row["row_id"]))
-    context()["cache"].commit()
-    return pd.DataFrame(list(merged.values())[:limit], columns=list(shortlist.columns) + ["member_row_ids"])
+        fast_seen.add(row.get('fast_key'))
+        if canonical_limit is not None and len(merged) >= limit:
+            break
+    columns = list(shortlist.columns) + ["member_row_ids"]
+    if canonical_limit is not None and 'canon_ik14' not in columns:
+        columns.append('canon_ik14')
+    records = list(merged.values())[:limit]
+    result = pd.DataFrame(records, columns=columns)
+    # Construct directly from Python integers: pandas inference can otherwise
+    # round mixed high-bit masks through float64 before a later uint64 cast.
+    for column in ('source_mask', 'scoring_source_mask'):
+        if column in result:
+            result[column] = np.array([int(r[column]) for r in records], dtype=np.uint64)
+    return result
 
 
 def external_coverage(db):

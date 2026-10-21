@@ -85,3 +85,6 @@ scratch/
 *.npy
 *.sqlite
 tmp_kaggle/
+*.json
+*.png
+*.pt
