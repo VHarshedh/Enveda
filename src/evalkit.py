@@ -9,6 +9,7 @@ import time
 import math
 import warnings
 import functools
+import threading
 from typing import Dict, List, Tuple, Optional, Union, Any, Set
 import numpy as np
 import pandas as pd
@@ -126,65 +127,60 @@ def standardize_mol(mol_or_smiles: Union[str, Chem.Mol]) -> Optional[Chem.Mol]:
 # ── 4. InChIKey Generation & Speed Guarded Canonicalization ───────────────────
 _IK14_CACHE: Dict[str, str] = {}
 _FAST_IK14_CACHE: Dict[str, str] = {}
+_CACHE_LOCK = threading.Lock()
+_thread_local = threading.local()
+
+def _get_tautomer_enumerator():
+    if not hasattr(_thread_local, 'te'):
+        te = rdMolStandardize.TautomerEnumerator()
+        te.SetMaxTautomers(50)
+        te.SetMaxTransforms(100)
+        _thread_local.te = te
+    return _thread_local.te
 
 def fast_key(mol_or_smiles: Union[str, Chem.Mol]) -> str:
-    """
-    Compute plain InChIKey14 without tautomer enumeration.
-    Extremely fast for candidate filtering and initial deduplication.
-    """
     if isinstance(mol_or_smiles, str):
-        if mol_or_smiles in _FAST_IK14_CACHE:
-            return _FAST_IK14_CACHE[mol_or_smiles]
+        with _CACHE_LOCK:
+            if mol_or_smiles in _FAST_IK14_CACHE:
+                return _FAST_IK14_CACHE[mol_or_smiles]
         smi = mol_or_smiles
         mol = Chem.MolFromSmiles(smi)
     else:
         smi = None
         mol = mol_or_smiles
     if mol is None:
-        return ""
+        return ''
     try:
         ik14 = Chem.MolToInchiKey(mol)[:14]
     except Exception:
-        ik14 = ""
+        ik14 = ''
     if smi is not None:
-        _FAST_IK14_CACHE[smi] = ik14
+        with _CACHE_LOCK:
+            _FAST_IK14_CACHE[smi] = ik14
     return ik14
 
-# Tautomer enumerator singleton with speed guards
-_TAUTOMER_ENUMERATOR = rdMolStandardize.TautomerEnumerator()
-_TAUTOMER_ENUMERATOR.SetMaxTautomers(50)
-_TAUTOMER_ENUMERATOR.SetMaxTransforms(100)
-
 def canon_ik14(mol_or_smiles: Union[str, Chem.Mol], timeout_sec: float = 1.5) -> str:
-    """
-    Compute official ground-truth canonical InChIKey14:
-    - RDKit TautomerEnumerator canonicalization
-    - Max tautomers = 50, max transforms = 100
-    - Fallback to fast_key on timeout or error
-    - In-memory cached
-    """
     if isinstance(mol_or_smiles, str):
         smi = mol_or_smiles.strip()
-        if smi in _IK14_CACHE:
-            return _IK14_CACHE[smi]
+        with _CACHE_LOCK:
+            if smi in _IK14_CACHE:
+                return _IK14_CACHE[smi]
         mol = Chem.MolFromSmiles(smi)
     else:
         smi = None
         mol = mol_or_smiles
     if mol is None:
-        return ""
-    # Speed guarded execution
+        return ''
     t0 = time.time()
     try:
-        canon_mol = _TAUTOMER_ENUMERATOR.Canonicalize(mol)
-        if time.time() - t0 > timeout_sec:
-            ik14 = Chem.MolToInchiKey(mol)[:14]
-        else:
-            ik14 = Chem.MolToInchiKey(canon_mol)[:14]
+        te = _get_tautomer_enumerator()
+        canon_mol = te.Canonicalize(mol)
+        ik14 = Chem.MolToInchiKey(mol if time.time() - t0 > timeout_sec else canon_mol)[:14]
     except Exception:
         ik14 = Chem.MolToInchiKey(mol)[:14]
     if smi is not None:
-        _IK14_CACHE[smi] = ik14
+        with _CACHE_LOCK:
+            _IK14_CACHE[smi] = ik14
     return ik14
 
 # ── 5. Fingerprint Generators ────────────────────────────────────────────────
@@ -409,3 +405,5 @@ def validate_submission(
         "n_warnings": len(warnings_list),
     }
     return is_valid, errors, warnings_list, summary
+
+

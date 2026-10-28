@@ -150,15 +150,17 @@ class Spec2SmilesModel(nn.Module):
         x = self.encoder(x, src_key_padding_mask=mask)
         valid = (~mask).unsqueeze(-1)
         pooled = self.norm(x[:, 0] + (x*valid).sum(1)/valid.sum(1).clamp_min(1))
-        with torch.no_grad():
-            counts = self.elem_count_head(pooled).detach().clamp(0, 200)
-            maccs_probs = torch.sigmoid(self.maccs_head(pooled)).detach()
-            heavy = self.heavy_atom_head(pooled).detach().clamp(1, 150) / 100.0
-            rings = self.ring_count_head(pooled).detach().clamp(0, 20) / 10.0
-            cond_vec = torch.cat((counts / 50.0, maccs_probs, heavy, rings), dim=-1)  # 179 dims
-            if return_fp:
+        # Keep AUX_HEAD_NAMES frozen, but compute outside torch.no_grad() without .detach()
+        # so gradients from self.condition flow back into pooled to refine encoder representations
+        counts = self.elem_count_head(pooled).clamp(0, 200)
+        maccs_probs = torch.sigmoid(self.maccs_head(pooled))
+        heavy = self.heavy_atom_head(pooled).clamp(1, 150) / 100.0
+        rings = self.ring_count_head(pooled).clamp(0, 20) / 10.0
+        cond_vec = torch.cat((counts / 50.0, maccs_probs, heavy, rings), dim=-1)  # 179 dims
+        if return_fp:
+            with torch.no_grad():
                 fp_probs = torch.sigmoid(self.fp_head(pooled) - self.pw_shift).detach()
-                return self.memory_proj(self.norm(x)), mask, pooled, cond_vec, counts, fp_probs, maccs_probs
+            return self.memory_proj(self.norm(x)), mask, pooled, cond_vec, counts.detach(), fp_probs, maccs_probs.detach()
         return self.memory_proj(self.norm(x)), mask, pooled, cond_vec
 
     def conditioned_memory(self, memory, mask, neutral_mass, pooled, cond_vec):
@@ -167,11 +169,14 @@ class Spec2SmilesModel(nn.Module):
         return torch.cat((cond_tok[:, None], memory), 1), torch.cat((mask[:, :1]*False, mask), 1)
 
     def decode(self, tokens, memory, mask):
-        x = self.token_emb(tokens)*math.sqrt(320) + self.positions[:tokens.shape[1]]
-        causal = torch.ones(tokens.shape[1], tokens.shape[1], device=x.device,
-                            dtype=torch.bool).triu(1)
-        x = self.decoder(x, memory, tgt_mask=causal, tgt_key_padding_mask=tokens.eq(0),
-                         memory_key_padding_mask=mask)
+        seq_len = tokens.shape[1]
+        x = self.token_emb(tokens)*math.sqrt(320) + self.positions[:seq_len]
+        causal = torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool).triu(1)
+        tgt_pad = tokens.eq(0)
+        tgt_mask = tgt_pad if tgt_pad.any() else None
+        mem_mask = mask if mask.any() else None
+        x = self.decoder(x, memory, tgt_mask=causal, tgt_key_padding_mask=tgt_mask,
+                         memory_key_padding_mask=mem_mask)
         return self.output(x)
 
     def forward(self, tokens, neutral_mass, **spectra):
@@ -197,6 +202,7 @@ class SpectrumDataset(torch.utils.data.Dataset):
     def __init__(self, path, cfg, tokenizer, smiles, tokens, augment=False, tokens_aug=None):
         self.cfg, self.tokenizer = cfg, tokenizer
         self.smiles, self.tokens, self.augment = smiles, tokens, augment
+        self.aug_prob = cfg.get('aug_prob', 0.65)
         self.tokens_aug = tokens[None, ...] if tokens_aug is None else tokens_aug
         if self.tokens_aug.ndim == 2:
             self.tokens_aug = self.tokens_aug[None, ...]
@@ -208,7 +214,7 @@ class SpectrumDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         r = self.rows[idx]
         t_idx = int(r['target'])
-        if self.augment and np.random.random() < 0.65:
+        if self.augment and np.random.random() < self.aug_prob:
             k = np.random.randint(0, self.tokens_aug.shape[0])
             target = self.tokens_aug[k, t_idx].astype(np.int64)
         else:
@@ -260,7 +266,7 @@ class EMA:
             dst.lerp_(src, 1-self.decay)
 
 
-def run_epoch(model, loader, device, optimizer=None, scaler=None, ema=None, scheduler=None):
+def run_epoch(model, loader, device, optimizer=None, scaler=None, ema=None, scheduler=None, label_smoothing=0.05):
     training = optimizer is not None
     model.train(training)
     raw = model.module if isinstance(model, nn.DataParallel) else model
@@ -279,7 +285,7 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None, ema=None, sche
             with torch.amp.autocast(device.type, dtype=torch.float16, enabled=device.type == 'cuda'):
                 logits = model(tokens=target[:, :-1], **batch)
                 loss = nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]),
-                    target[:, 1:].reshape(-1), ignore_index=0, label_smoothing=0.05)
+                    target[:, 1:].reshape(-1), ignore_index=0, label_smoothing=label_smoothing)
             if not torch.isfinite(loss):
                 raise FloatingPointError('Non-finite SMILES loss; check spectra and checkpoint')
             if training:
@@ -302,7 +308,7 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None, ema=None, sche
 
 
 @torch.no_grad()
-def beam_search(model, memory, mask, beam_size=16, max_len=124, top_k=25):
+def beam_search(model, memory, mask, beam_size=14, max_len=96, top_k=25, archive_size=64):
     """Decode B molecules together; return length-penalized completed paths."""
     if beam_size < 1 or max_len < 2 or max_len > 128 or top_k < 1:
         raise ValueError('Invalid beam size, sequence budget, or candidate count')
@@ -313,9 +319,10 @@ def beam_search(model, memory, mask, beam_size=16, max_len=124, top_k=25):
     seq = torch.ones((b, k, 1), dtype=torch.long, device=device)
     scores = torch.full((b, k), -torch.inf, device=device)
     scores[:, 0] = 0
-    archive_size = max(top_k * 10, 256)
+    archive_size = max(archive_size, top_k)
     archive_scores = torch.full((b, archive_size), -torch.inf, device=device)
     archive = torch.zeros((b, archive_size, max_len), dtype=torch.long, device=device)
+    stop_idx = min(top_k - 1, archive_size - 1)
     for step in range(1, max_len):
         logits = model.decode(seq.reshape(b*k, -1), memory, mask)
         logp = logits[:, -1].float().log_softmax(-1).reshape(b, k, -1)
@@ -335,11 +342,13 @@ def beam_search(model, memory, mask, beam_size=16, max_len=124, top_k=25):
         archive = torch.cat((archive, padded), 1).gather(1, keep[:, :, None].expand(-1, -1, max_len))
         scores, live = values.masked_fill(tokens.eq(2), -torch.inf).topk(k, dim=1)
         seq = paths.gather(1, live[:, :, None].expand(-1, -1, step+1))
-        live_upper = scores.max(1).values / (max_len ** 0.7)
-        done = live_upper <= archive_scores[:, -1]
-        scores = scores.masked_fill(done[:, None], -torch.inf)
-        if not torch.isfinite(scores).any():
-            break
+        if step >= 20:
+            live_upper = scores.max(1).values / ((step + 1) ** 0.7)
+            target_thresh = archive_scores[:, stop_idx]
+            done = (target_thresh > -torch.inf) & (live_upper <= target_thresh)
+            scores = scores.masked_fill(done[:, None], -torch.inf)
+            if not torch.isfinite(scores).any():
+                break
     result = []
     for paths, values in zip(archive.cpu().tolist(), archive_scores.cpu().tolist()):
         result.append([(ids[:ids.index(2)+1], score) for ids, score in zip(paths, values)
@@ -348,7 +357,7 @@ def beam_search(model, memory, mask, beam_size=16, max_len=124, top_k=25):
 
 
 @torch.no_grad()
-def generate_candidates(model, tokenizer, query_df, device, beam_size=16, top_k=25, mol_batch_size=64, max_len=124):
+def generate_candidates(model, tokenizer, query_df, device, beam_size=14, top_k=25, mol_batch_size=64, max_len=96):
     model = model.module if isinstance(model, nn.DataParallel) else model
     model.eval()
     device = torch.device(device)
@@ -366,7 +375,8 @@ def generate_candidates(model, tokenizer, query_df, device, beam_size=16, top_k=
             mass = float(group.neutral_mass.median())
             if not math.isfinite(mass) or mass <= 0:
                 raise ValueError(f'Invalid neutral mass for {molecule_id}')
-            meta_mem_sum, pooled_sum, cond_sum, elem_sum, fp_sum, maccs_sum, n = None, None, None, None, None, None, 0
+            meta_mem_sum, pooled_sum, cond_sum, elem_sum, fp_sum, maccs_sum = None, None, None, None, None, None
+            total_weight = 0.0
             peak_tokens_list, peak_intens_list, peak_mzs_list = [], [], []
             with torch.amp.autocast(device.type, dtype=torch.float16, enabled=device.type == 'cuda'):
                 for start in range(0, len(group), 32):
@@ -376,24 +386,26 @@ def generate_candidates(model, tokenizer, query_df, device, beam_size=16, top_k=
                     memory, mask, pooled, cond_vec, counts, fp_p, maccs_p = model.encode(
                         **{k: v.to(device) for k, v in batch.items()}, return_fp=True
                     )
-                    # Global tokens 0, 1, 2 (CLS, meta1, meta2) are positionally aligned across spectra
-                    meta_mem = memory[:, :3].float().sum(0, keepdim=True)
+                    # Weight spectra by sqrt(n_peaks) for signal-to-noise calibrated pooling
+                    valid_peaks = ~mask[:, 3:]
+                    w_spec = valid_peaks.sum(1).float().sqrt().clamp_min(1.0)
+                    w_col = w_spec[:, None]
+                    meta_mem = (memory[:, :3].float() * w_spec[:, None, None]).sum(0, keepdim=True)
                     meta_mem_sum = meta_mem if meta_mem_sum is None else meta_mem_sum + meta_mem
-                    pooled_sum = pooled.float().sum(0, keepdim=True) if pooled_sum is None else pooled_sum + pooled.float().sum(0, keepdim=True)
-                    cond_sum = cond_vec.float().sum(0, keepdim=True) if cond_sum is None else cond_sum + cond_vec.float().sum(0, keepdim=True)
-                    elem_sum = counts.float().sum(0, keepdim=True) if elem_sum is None else elem_sum + counts.float().sum(0, keepdim=True)
-                    fp_sum = fp_p.float().sum(0) if fp_sum is None else fp_sum + fp_p.float().sum(0)
-                    maccs_sum = maccs_p.float().sum(0) if maccs_sum is None else maccs_sum + maccs_p.float().sum(0)
-                    n += len(items)
+                    pooled_w = (pooled.float() * w_col).sum(0, keepdim=True)
+                    pooled_sum = pooled_w if pooled_sum is None else pooled_sum + pooled_w
+                    cond_w = (cond_vec.float() * w_col).sum(0, keepdim=True)
+                    cond_sum = cond_w if cond_sum is None else cond_sum + cond_w
+                    elem_w = (counts.float() * w_col).sum(0, keepdim=True)
+                    elem_sum = elem_w if elem_sum is None else elem_sum + elem_w
+                    fp_sum = (fp_p.float() * w_col).sum(0) if fp_sum is None else fp_sum + (fp_p.float() * w_col).sum(0)
+                    maccs_sum = (maccs_p.float() * w_col).sum(0) if maccs_sum is None else maccs_sum + (maccs_p.float() * w_col).sum(0)
+                    total_weight += float(w_spec.sum().item())
                     for it in items:
                         peak_mzs_list.append(torch.from_numpy(it['mz']).float().to(device))
-                    # Gather valid fragment peak tokens without averaging misaligned m/z indices
-                    valid_peaks = ~mask[:, 3:]
                     peak_tokens_list.append(memory[:, 3:][valid_peaks].float())
                     peak_intens_list.append(batch['peaks'][..., 64].to(device)[valid_peaks].float())
 
-                # Select top_k_peaks highest-intensity fragment embeddings across the molecule's spectra,
-                # deduplicating peaks within 0.01 Da bins across replicate spectra
                 all_peak_toks = torch.cat(peak_tokens_list, dim=0)
                 all_peak_ints = torch.cat(peak_intens_list, dim=0)
                 all_peak_mzs = torch.cat(peak_mzs_list, dim=0) if peak_mzs_list else torch.zeros(0, device=device)
@@ -405,23 +417,22 @@ def generate_candidates(model, tokenizer, query_df, device, beam_size=16, top_k=
                     _, unique_pos = np.unique(bins.cpu().numpy(), return_index=True)
                     dedup_idx = sorted_idx[torch.from_numpy(np.sort(unique_pos)).to(device)]
                     take = min(top_k_peaks, len(dedup_idx))
-                    chosen = dedup_idx[:take]
-                    mz_sort = torch.argsort(all_peak_mzs[chosen])
-                    chosen = chosen[mz_sort]
+                    chosen = dedup_idx[:take][torch.argsort(all_peak_mzs[dedup_idx[:take]])]
                     mol_peaks[0, :take] = all_peak_toks[chosen]
                     mol_peak_mask[0, :take] = False
 
-                mol_mem = torch.cat([meta_mem_sum / n, mol_peaks], dim=1)
+                w_norm = max(total_weight, 1e-6)
+                mol_mem = torch.cat([meta_mem_sum / w_norm, mol_peaks], dim=1)
                 mol_mask = torch.cat([torch.zeros((1, 3), dtype=torch.bool, device=device), mol_peak_mask], dim=1)
                 memory, mask = model.conditioned_memory(
-                    mol_mem, mol_mask, torch.tensor([mass], device=device), pooled_sum / n, cond_sum / n
+                    mol_mem, mol_mask, torch.tensor([mass], device=device), pooled_sum / w_norm, cond_sum / w_norm
                 )
             memories.append(memory)
             masks.append(mask)
             masses.append(mass)
-            pred_fps.append((fp_sum / n).cpu().numpy())
-            pred_maccs.append((maccs_sum / n).cpu().numpy())
-            pred_elems.append((elem_sum.squeeze(0) / n).cpu().numpy())
+            pred_fps.append((fp_sum / w_norm).cpu().numpy())
+            pred_maccs.append((maccs_sum / w_norm).cpu().numpy())
+            pred_elems.append((elem_sum.squeeze(0) / w_norm).cpu().numpy())
 
         with torch.amp.autocast(device.type, dtype=torch.float16, enabled=device.type == 'cuda'):
             hypotheses = beam_search(model, torch.cat(memories), torch.cat(masks),
@@ -430,68 +441,57 @@ def generate_candidates(model, tokenizer, query_df, device, beam_size=16, top_k=
         for (molecule_id, _), mass, p_fp, p_mc, p_el, paths in zip(
             chunk, masses, pred_fps, pred_maccs, pred_elems, hypotheses
         ):
-            unique = {}
             p_fp_clip = np.clip(p_fp, 1e-6, 1.0 - 1e-6)
             fp_logits = np.log(p_fp_clip) - np.log1p(-p_fp_clip)
             fp_log_not_p = float(np.sum(-np.logaddexp(0.0, fp_logits)))
-            p_fp_sum = float(p_fp.sum())
-            p_fp_norm = float(np.linalg.norm(p_fp))
-            p_mc_sum = float(p_mc.sum())
-            p_mc_norm = float(np.linalg.norm(p_mc))
+            p_fp_norm, p_mc_norm = float(np.linalg.norm(p_fp)), float(np.linalg.norm(p_mc))
+            p_fp_sum, p_mc_sum = float(p_fp.sum()), float(p_mc.sum())
+            seen_raw_smi, pre_candidates = set(), {}
+
             for ids, log_prob in paths:
                 smi = tokenizer.decode(ids)
+                if not smi or smi in seen_raw_smi:
+                    continue
+                seen_raw_smi.add(smi)
                 raw_mol = Chem.MolFromSmiles(smi)
-                if raw_mol is None or raw_mol.GetNumAtoms() == 0:
+                if raw_mol is None or raw_mol.GetNumAtoms() == 0 or any(a.GetSymbol() not in ELEMENTS_ORDER for a in raw_mol.GetAtoms()):
                     continue
-                mol = evalkit.standardize_mol(raw_mol) or raw_mol
-                if any(a.GetSymbol() not in ELEMENTS_ORDER for a in mol.GetAtoms()):
-                    continue
+                raw_wt = float(rdMolDescriptors.CalcExactMolWt(raw_mol))
+                mol = (evalkit.standardize_mol(raw_mol) or raw_mol) if (Chem.GetFormalCharge(raw_mol) != 0 or '.' in smi) else raw_mol
+                mol_wt = float(rdMolDescriptors.CalcExactMolWt(mol)) if mol is not raw_mol else raw_wt
                 key = evalkit.fast_key(mol)
                 if not key:
                     continue
-                ppm = abs(rdMolDescriptors.CalcExactMolWt(mol) - mass) / mass * 1e6
-                # Full Self-Spec2FP Discriminative Reranking (Morgan4096 + MACCS167 + NB + Elem)
-                c_fp = evalkit.compute_morgan_fp(mol).astype(np.float32)
-                c_mc = evalkit.compute_maccs_fp(mol).astype(np.float32)
-                c_fp_sum = float(c_fp.sum())
-                c_mc_sum = float(c_mc.sum())
-                dot_fp = float(c_fp @ p_fp)
+                ppm = abs(mol_wt - mass) / mass * 1e6
+                mass_score = -0.5 * (min(ppm, 50.0) / 7.5) ** 2
+                pre_score = log_prob + 0.80 * mass_score
+                if key not in pre_candidates or pre_score > pre_candidates[key][0]:
+                    pre_candidates[key] = (pre_score, log_prob, mass_score, ppm, mol, key)
+
+            # Two-stage candidate reranking: Top 28 unique fast_key candidates
+            top28 = sorted(pre_candidates.values(), key=lambda x: -x[0])[:28]
+            full_candidates = []
+            for _, log_prob, mass_score, ppm, mol, key in top28:
+                c_fp, c_mc = evalkit.compute_morgan_fp(mol).astype(np.float32), evalkit.compute_maccs_fp(mol).astype(np.float32)
+                dot_fp, dot_mc = float(c_fp @ p_fp), float(c_mc @ p_mc)
+                c_fp_sum, c_mc_sum = float(c_fp.sum()), float(c_mc.sum())
                 cos_sim = dot_fp / max(math.sqrt(c_fp_sum) * p_fp_norm, 1e-8)
                 tan_sim = dot_fp / max(c_fp_sum + p_fp_sum - dot_fp, 1e-8)
                 nb_ll = (float(c_fp @ fp_logits) + fp_log_not_p) / 4096.0
-                dot_mc = float(c_mc @ p_mc)
                 maccs_cos = dot_mc / max(math.sqrt(c_mc_sum) * p_mc_norm, 1e-8)
                 maccs_tan = dot_mc / max(c_mc_sum + p_mc_sum - dot_mc, 1e-8)
                 elem_dist = float(np.abs(mol_elem_counts(mol) - p_el).sum())
-                mass_score = -0.5 * (min(ppm, 50.0) / 7.5) ** 2
+                score = (log_prob + 2.0 * nb_ll + 1.8 * cos_sim + 1.8 * tan_sim
+                         + 0.6 * maccs_cos + 0.6 * maccs_tan + 0.80 * mass_score - 0.04 * elem_dist)
+                full_candidates.append(dict(molecule_id=str(molecule_id), smiles=Chem.MolToSmiles(mol, isomericSmiles=False),
+                                            fast_key=key, score=score, log_prob=log_prob, nb_ll=nb_ll, cos_sim=cos_sim,
+                                            tan_sim=tan_sim, maccs_cos=maccs_cos, maccs_tan=maccs_tan,
+                                            elem_dist=elem_dist, ppm_err=ppm, source='spec2smiles'))
 
-                # Hybrid generative + Stage06-aligned discriminative score
-                score = (
-                    log_prob
-                    + 2.0 * nb_ll
-                    + 1.8 * cos_sim
-                    + 1.8 * tan_sim
-                    + 0.6 * maccs_cos
-                    + 0.6 * maccs_tan
-                    + 0.40 * mass_score
-                    - 0.04 * elem_dist
-                )
-                candidate = dict(
-                    molecule_id=str(molecule_id),
-                    smiles=Chem.MolToSmiles(mol, isomericSmiles=False),
-                    fast_key=key, score=score, log_prob=log_prob,
-                    nb_ll=nb_ll, cos_sim=cos_sim, tan_sim=tan_sim,
-                    maccs_cos=maccs_cos, maccs_tan=maccs_tan,
-                    elem_dist=elem_dist, ppm_err=ppm, source='spec2smiles'
-                )
-                if key not in unique or score > unique[key]['score']:
-                    unique[key] = candidate
-
-            # Tautomer-canonical deduplication on shortlist
-            canon_seen = set()
-            rank = 0
-            for candidate in sorted(unique.values(), key=lambda x: -x['score']):
-                ik14 = evalkit.canon_ik14(candidate['smiles'])
+            # Fast tautomer deduplication: top 12 use canon_ik14, ranks 13-25 use fast_key
+            canon_seen, rank = set(), 0
+            for candidate in sorted(full_candidates, key=lambda x: -x['score']):
+                ik14 = evalkit.canon_ik14(candidate['smiles']) if rank < 12 else (candidate.get('fast_key') or evalkit.fast_key(candidate['smiles']))
                 if not ik14 or ik14 in canon_seen:
                     continue
                 canon_seen.add(ik14)
@@ -507,3 +507,4 @@ def generate_candidates(model, tokenizer, query_df, device, beam_size=16, top_k=
         'maccs_cos': 'float64', 'maccs_tan': 'float64',
         'elem_dist': 'float64', 'ppm_err': 'float64'
     })
+
