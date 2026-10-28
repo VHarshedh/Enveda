@@ -1383,7 +1383,7 @@ for i, cell in enumerate(nb.cells):
             sys.exit(1)
 
 # Save
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "01_eda_schema.ipynb")
+out_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks", "01_eda_schema.ipynb")
 with open(out_path, "w", encoding="utf-8") as f:
     nbf.write(nb, f)
 

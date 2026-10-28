@@ -85,6 +85,10 @@ scratch/
 *.npy
 *.sqlite
 tmp_kaggle/
+stage06_*
 *.json
 *.png
 *.pt
+tmp*
+*.parquet
+*cache*

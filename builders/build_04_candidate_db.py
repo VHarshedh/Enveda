@@ -1905,6 +1905,7 @@ The module `/kaggle/working/candidates.py` is printed below for reuse in downstr
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=Path(__file__).with_name("04_candidate_db.ipynb"))
+    default_out = Path(__file__).resolve().parent.parent / "notebooks" / "04_candidate_db.ipynb"
+    parser.add_argument("--output", type=Path, default=default_out)
     args = parser.parse_args()
     build_notebook(args.output)

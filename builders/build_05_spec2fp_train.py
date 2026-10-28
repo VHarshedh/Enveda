@@ -1247,7 +1247,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path,
-                        default=Path(__file__).with_name("05_spec2fp_train.ipynb"))
+    default_out = Path(__file__).resolve().parent.parent / "notebooks" / "05_spec2fp_train.ipynb"
+    parser.add_argument("--output", type=Path, default=default_out)
     args = parser.parse_args()
     build_notebook(args.output)

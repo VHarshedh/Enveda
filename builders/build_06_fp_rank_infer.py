@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 import textwrap
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / 'src'
+NOTEBOOKS = ROOT / 'notebooks'
 
 
 def build_notebook():
@@ -62,12 +64,18 @@ def build_notebook():
     written to and imported strictly from `/kaggle/working/`. The candidate module
     checks the database fingerprint schema against evalkit before retrieval.
     ''')
-    sources = {name: (ROOT / name).read_text(encoding='utf-8')
+    def _read_mod(name):
+        p = (SRC / name) if (SRC / name).is_file() else (ROOT / name)
+        return p.read_text(encoding='utf-8')
+
+    sources = {name: _read_mod(name)
                for name in ('evalkit.py', 'candidates.py', 'fprank.py')}
-    if (ROOT / 'spec2fp.py').is_file():
-        sources['spec2fp.py'] = (ROOT / 'spec2fp.py').read_text(encoding='utf-8')
+    spec2fp_p = (SRC / 'spec2fp.py') if (SRC / 'spec2fp.py').is_file() else (ROOT / 'spec2fp.py')
+    if spec2fp_p.is_file():
+        sources['spec2fp.py'] = spec2fp_p.read_text(encoding='utf-8')
     else:
-        tree = ast.parse((ROOT / 'build_05_spec2fp_train.py').read_text(encoding='utf-8'))
+        b05_p = (ROOT / 'builders' / 'build_05_spec2fp_train.py') if (ROOT / 'builders' / 'build_05_spec2fp_train.py').is_file() else (ROOT / 'build_05_spec2fp_train.py')
+        tree = ast.parse(b05_p.read_text(encoding='utf-8'))
         sources['spec2fp.py'] = next(ast.literal_eval(n.value) for n in tree.body
                                    if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'SPEC2FP_SOURCE' for t in n.targets))
     for filename, source in sources.items():
@@ -405,6 +413,6 @@ if __name__ == '__main__':
     nb_str = json.dumps(nb_dict, indent=1, ensure_ascii=False)
     for fname in ('06_fp_rank_infer.ipynb', '06_fp_rank_infer_2.ipynb', '06_fp_rank_infer_3.ipynb',
                   '06_fp_rank_infer_4.ipynb'):
-        out_path = ROOT / fname
+        out_path = NOTEBOOKS / fname
         out_path.write_text(nb_str, encoding='utf-8')
         print(f"Generated {out_path}")

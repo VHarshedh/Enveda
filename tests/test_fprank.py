@@ -17,6 +17,21 @@ import pytest
 
 import fprank as fr
 
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / 'src'
+BUILDERS = ROOT / 'builders'
+NOTEBOOKS = ROOT / 'notebooks'
+
+def find_path(rel_path):
+    p = Path(rel_path)
+    if p.is_file():
+        return p
+    for base in (SRC, BUILDERS, NOTEBOOKS, ROOT):
+        cand = base / p.name
+        if cand.is_file():
+            return cand
+    return p
+
 
 def test_tuning_diagnostics_use_fixed_twenty_ppm_cohort():
     # q0 rank 1; q1 rank 2; q2 fallback-only rank 1; q3 missing.
@@ -73,7 +88,7 @@ def test_notebook_coverage_denominators_include_missing_queries():
 @pytest.fixture
 def candidate_api(monkeypatch):
     # Exercise the actual pure Stage 04 implementations, replacing only disk and chemistry I/O.
-    tree = ast.parse(Path('candidates.py').read_text())
+    tree = ast.parse(find_path('candidates.py').read_text(encoding='utf-8'))
     names = {'filter_sources', 'mass_bounds', 'finalize_candidates'}
     selected = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
     api = types.ModuleType('candidates')
@@ -357,7 +372,7 @@ def test_notebook_builds_with_compilable_cells():
             if py_lines.strip():
                 ast.parse(py_lines)
     embedded = ast.parse(book['cells'][5]['source']).body[0].value.args[0].value
-    assert embedded == Path('fprank.py').read_text()
+    assert embedded == find_path('fprank.py').read_text(encoding='utf-8')
 
 
 def test_manifest_stage09_contract():
@@ -382,7 +397,7 @@ def chemistry_api(candidate_api):
     api = candidate_api
     names = {'get_fingerprints', 'canonical_key', 'memory_cache_put', 'cache_written',
              'flush_cache', 'prefetch_canonical_keys', 'batched'}
-    tree = ast.parse(Path('candidates.py').read_text())
+    tree = ast.parse(find_path('candidates.py').read_text(encoding='utf-8'))
     selected = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
     api.itertools = itertools
     api._MEM_IK14_CACHE, api._MEM_FP_CACHE = OrderedDict(), OrderedDict()
@@ -495,7 +510,7 @@ def test_normalized_output_preserves_high_bit_masks(candidate_api):
 
 def test_cache_configure_wal_normal_and_reset(chemistry_api):
     api = chemistry_api
-    tree = ast.parse(Path('candidates.py').read_text())
+    tree = ast.parse(find_path('candidates.py').read_text(encoding='utf-8'))
     names = {'configure', 'open_sql'}
     exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],
                             type_ignores=[]), 'candidates.py', 'exec'), api.__dict__)
@@ -601,13 +616,13 @@ def test_top100_recall_matches_fast_tail_and_canonical_prefix():
 
 def test_saved_stage06_candidate_source_and_metrics_are_current():
     from build_06_fp_rank_infer import build_notebook
-    saved = json.loads(Path('06_fp_rank_infer.ipynb').read_text(encoding='utf-8'))
+    saved = json.loads(find_path('06_fp_rank_infer.ipynb').read_text(encoding='utf-8'))
     generated = build_notebook()
     for i in (4, 12, 13):
         assert ''.join(saved['cells'][i]['source']) == generated['cells'][i]['source']
     embedded = ast.parse(''.join(saved['cells'][4]['source'])).body[0].value.args[0].value
-    assert embedded == Path('candidates.py').read_text(encoding='utf-8')
-    stage04_tree = ast.parse(Path('build_04_candidate_db.py').read_text(encoding='utf-8'))
+    assert embedded == find_path('candidates.py').read_text(encoding='utf-8')
+    stage04_tree = ast.parse(find_path('build_04_candidate_db.py').read_text(encoding='utf-8'))
     stage04_source = next(ast.literal_eval(n.value) for n in stage04_tree.body
                           if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and
                              t.id == 'MODULE_SOURCE' for t in n.targets))
@@ -619,7 +634,7 @@ def test_saved_stage06_candidate_source_and_metrics_are_current():
 
 
 def test_ingest_metadata_global_median_and_consensus_smiles():
-    tree = ast.parse(Path('candidates.py').read_text(encoding='utf-8'))
+    tree = ast.parse(find_path('candidates.py').read_text(encoding='utf-8'))
     func_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'ingest_metadata')
     adapter_node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'SchemaAdapter')
 

@@ -20,7 +20,9 @@ import nbformat as nbf
 
 NOTEBOOK_CELLS: list = []
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / "src"
+NOTEBOOKS = ROOT / "notebooks"
 
 EXACT_CELL_IDS = [
     "4f325ce3", "b6bd082c", "dbe328fd", "17d6790d", "e9aa6fb9",
@@ -390,7 +392,7 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
     code("!pip install rdkit", check_len=False)
 
     # Cell 03: 17d6790d - Embedded evalkit.py
-    evalkit_file = ROOT / "evalkit.py"
+    evalkit_file = (SRC / "evalkit.py") if (SRC / "evalkit.py").is_file() else (ROOT / "evalkit.py")
     evalkit_source = evalkit_file.read_text(encoding="utf-8") if evalkit_file.is_file() else ""
     code(f"%%writefile evalkit.py\n{evalkit_source}", check_len=False)
 
@@ -1416,6 +1418,6 @@ def build_notebook(output: Path) -> nbf.NotebookNode:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path,
-                        default=Path(__file__).with_name("05b_spec2fp_finetune.ipynb"))
+                        default=NOTEBOOKS / "05b_spec2fp_finetune.ipynb")
     args = parser.parse_args()
     build_notebook(args.output)

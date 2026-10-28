@@ -5,6 +5,27 @@ import tempfile
 import shutil
 import unittest
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / 'src'
+BUILDERS = ROOT / 'builders'
+NOTEBOOKS = ROOT / 'notebooks'
+
+for p in (ROOT, SRC, BUILDERS):
+    p_str = str(p)
+    if p_str not in sys.path:
+        sys.path.insert(0, p_str)
+
+def find_path(rel_path):
+    p = Path(rel_path)
+    if p.is_file():
+        return p
+    for base in (SRC, BUILDERS, NOTEBOOKS, ROOT):
+        cand = base / p.name
+        if cand.is_file():
+            return cand
+    return p
 from unittest.mock import patch
 
 import nbformat
@@ -154,7 +175,7 @@ class Stage07Tests(unittest.TestCase):
                     exec(cell['source'], scope)
             for name in ('spec2fp.py', 'spec2smiles.py', 'evalkit.py'):
                 self.assertEqual((Path(tmp)/name).read_text(encoding='utf-8'),
-                                 Path(name).read_text(encoding='utf-8'))
+                                 find_path(name).read_text(encoding='utf-8'))
 
     def test_notebook_synthetic_pipeline(self):
         # Execute the notebook on CPU with a tiny encoder/two epochs. Chemistry

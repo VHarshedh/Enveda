@@ -1,0 +1,7 @@
+PASS: Glucose Tautomer InChIKey14 Equivalence (WQZGKKKJIJFFOK)
+PASS: MRR@25 Rank Positions (1, 2, 25, Miss)
+PASS: MRR@25 Duplicate Rank Waste Diagnostic
+PASS: Submission Rejection Rules & Parseability
+PASS: Desalting & Neutralization Invariant
+PASS: Fingerprint Spec Dimensions (Morgan 4096, MACCS 167)
+PASS: Adduct Carrier Mass Lookup Table

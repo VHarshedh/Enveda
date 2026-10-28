@@ -4,7 +4,9 @@ import json
 import textwrap
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / 'src'
+NOTEBOOKS = ROOT / 'notebooks'
 
 
 def build_notebook():
@@ -73,7 +75,8 @@ def build_notebook():
     ''')
     # Literal source fragments are AST-valid Python; no %%writefile magic cells.
     for name in ('spec2fp.py', 'spec2smiles.py', 'evalkit.py'):
-        source = (ROOT / name).read_text(encoding='utf-8')
+        source_path = (SRC / name) if (SRC / name).is_file() else (ROOT / name)
+        source = source_path.read_text(encoding='utf-8')
         ast.parse(source)
         code(f"module_path = WORK / {name!r}\nmodule_path.write_text('', encoding='utf-8')")
         lines = source.splitlines(keepends=True)
@@ -379,6 +382,6 @@ def build_notebook():
 
 if __name__ == '__main__':
     notebook = build_notebook()
-    path = ROOT / '07_spec2smiles_train.ipynb'
+    path = NOTEBOOKS / '07_spec2smiles_train.ipynb'
     path.write_text(json.dumps(notebook, indent=1, ensure_ascii=False), encoding='utf-8')
     print(f'Generated {path} ({len(notebook["cells"])} cells)')

@@ -6,7 +6,7 @@ import ast
 from pathlib import Path
 import nbformat as nbf
 
-NOTEBOOK_PATH = Path("05b_spec2fp_finetune.ipynb")
+NOTEBOOK_PATH = Path(__file__).resolve().parent.parent / "notebooks" / "05b_spec2fp_finetune.ipynb"
 
 CELL_FA64E0AC_SOURCE = '''raw = model.module if hasattr(model, "module") else model
 head_lr, llrd_gamma = 1e-4, 0.80

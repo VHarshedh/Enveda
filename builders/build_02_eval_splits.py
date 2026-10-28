@@ -1338,7 +1338,7 @@ for i, cell in enumerate(nb.cells):
             print(f"SYNTAX ERROR in cell {i}: {e}", file=sys.stderr)
             sys.exit(1)
 
-out_ipynb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "02_eval_splits.ipynb")
+out_ipynb = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks", "02_eval_splits.ipynb")
 with open(out_ipynb, "w", encoding="utf-8") as f:
     nbf.write(nb, f)
 
