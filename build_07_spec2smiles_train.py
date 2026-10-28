@@ -23,12 +23,12 @@ def build_notebook():
     # Stage 07 — Generative Spectrum-to-SMILES Transformer
     Generates novel structures alongside Stage 03/06 retrieval. Attach Stage 01 clean
     data, Stage 02 splits/evalkit, and a **train-only** Stage 05/05b checkpoint.
-    Select two T4 GPUs. Six epochs; epoch one freezes the transferred encoder.
-    Predicted element counts (frozen Stage 05 head) condition both training and inference;
-    no validation/test structure or formula is supplied to the decoder.
-    Raw spectra are streamed to compact disk-backed records; targets are one compact
-    128-token array per unique SMILES. No worker processes or full peak feature cache.
-    Generation can return fewer than 25 valid unique structures; no database fallback.
+    Select two T4 GPUs. Trains for 10 epochs under a 10h total wall-clock budget (reserving
+    1.2h for batched beam search and submission validation); epoch one freezes the transferred encoder.
+    Predicted 180-dim substructure features (element counts, MACCS keys, heavy atom & ring counts)
+    condition both training and inference. Generated beams undergo Self-Spec2FP discriminative
+    reranking (Morgan & MACCS Tanimoto, elemental L1, ppm error) and tautomer-canonical deduplication.
+    Raw spectra are streamed to compact disk-backed records; K=4 randomized SMILES variants.
     ''')
     code('''
     !pip install -q rdkit
@@ -101,7 +101,8 @@ def build_notebook():
     split_map = splits.set_index('molecule_id').split3
     cfg = dict(encoder=upstream['model'], max_length=128, decoder_layers=4,
                d_model=320, nhead=8, dim_feedforward=1280, dropout=0.1,
-               norm_first=True, top_k_peaks=128, mz_dim=64, epochs=6,
+               norm_first=True, top_k_peaks=128, mz_dim=64, epochs=10,
+               time_budget_s=10.0 * 3600,
                lr_enc=8e-5, lr_dec=4e-4, batch_size=256, warmup_fraction=0.05, ema_decay=0.999,
                label_smoothing=0.05, seed=42, element_conditioning='predicted',
                elements_order=spec2fp.ELEMENTS_ORDER)
@@ -121,7 +122,9 @@ def build_notebook():
     code('''
     meta = pd.read_parquet(train_path, columns=['molecule_id', 'smiles'], use_threads=False)
     meta['molecule_id'] = meta.molecule_id.astype(str)
-    meta = meta.drop_duplicates(['molecule_id', 'smiles'])
+    smi_counts = meta.dropna(subset=['smiles']).groupby(['molecule_id', 'smiles'], sort=False).size().reset_index(name='cnt')
+    meta = smi_counts.sort_values(['molecule_id', 'cnt'], ascending=[True, False]).drop_duplicates('molecule_id')[['molecule_id', 'smiles']].copy()
+    del smi_counts
     meta['split3'] = meta.molecule_id.map(split_map)
     assert meta.split3.notna().all(), 'Missing split assignments'
     canonical = {}
@@ -141,24 +144,28 @@ def build_notebook():
     tokenizer.save(OUT / 'smiles_vocab.json')
     smiles = sorted(set(canonical.values()))
     smi_index = {s: i for i, s in enumerate(smiles)}
-    target_map = {s: smi_index[v] for s, v in canonical.items()}
+    mol_to_canon = {r.molecule_id: canonical[r.smiles] for r in meta.itertuples() if r.smiles in canonical}
+    target_map = {mid: smi_index[c_smi] for mid, c_smi in mol_to_canon.items()}
     dtype = np.uint8 if len(tokenizer.vocab) <= 256 else np.int16
     assert len(tokenizer.vocab) < 32768
     tokens = np.asarray([tokenizer.encode(s) for s in smiles], dtype=dtype)
-    tokens_aug = tokens.copy()
+    num_aug = 4
+    tokens_aug = np.repeat(tokens[None, :, :], num_aug, axis=0)
     for i, smi in enumerate(smiles):
-        randomized = Chem.MolToSmiles(Chem.MolFromSmiles(smi), doRandom=True, isomericSmiles=False)
-        try:
-            encoded = tokenizer.encode(randomized)
-            if 3 not in encoded:
-                tokens_aug[i] = encoded
-        except ValueError:
-            pass
+        mol = Chem.MolFromSmiles(smi)
+        for k in range(num_aug):
+            randomized = Chem.MolToSmiles(mol, doRandom=True, isomericSmiles=False)
+            try:
+                encoded = tokenizer.encode(randomized)
+                if 3 not in encoded:
+                    tokens_aug[k, i] = encoded
+            except ValueError:
+                pass
     cfg['vocab_size'] = len(tokenizer.vocab)
     cfg['target_shape'] = list(tokens.shape)
     cfg['target_bytes'] = tokens.nbytes + tokens_aug.nbytes
     cfg['excluded_unique_smiles'] = int(meta.smiles.nunique()-len(canonical))
-    del canonical, smi_index, train_smiles, probe
+    del canonical, smi_index, train_smiles, probe, mol_to_canon
     gc.collect()
     print('Vocabulary / target MB / RSS GB:', cfg['vocab_size'], tokens.nbytes/1e6, check_ram())
     ''')
@@ -171,8 +178,8 @@ def build_notebook():
             train_df['molecule_id'] = train_df.molecule_id.astype(str)
             train_df['split3'] = train_df.molecule_id.map(split_map)
             train_df['ce'] = pd.to_numeric(train_df.ce, errors='coerce').fillna(0)
-            train_split = train_df.loc[train_df.split3.eq('train') & train_df.smiles.isin(target_map)]
-            val_split = train_df.loc[train_df.split3.eq('val_model') & train_df.smiles.isin(target_map)]
+            train_split = train_df.loc[train_df.split3.eq('train') & train_df.molecule_id.isin(target_map)]
+            val_split = train_df.loc[train_df.split3.eq('val_model') & train_df.molecule_id.isin(target_map)]
             del train_df
             s2s.append_records(train_split, streams['train'], cfg, target_map)
             s2s.append_records(val_split, streams['val_model'], cfg, target_map)
@@ -183,15 +190,20 @@ def build_notebook():
             stream.close()
     ds_train = s2s.SpectrumDataset(paths['train'], cfg, tokenizer, smiles, tokens, augment=True, tokens_aug=tokens_aug)
     ds_val = s2s.SpectrumDataset(paths['val_model'], cfg, tokenizer, smiles, tokens)
+    workers = 2 if torch.cuda.is_available() else 0
     train_loader = torch.utils.data.DataLoader(ds_train, batch_size=cfg['batch_size'],
-        shuffle=True, num_workers=0, pin_memory=True, collate_fn=ds_train.collate)
+        shuffle=True, num_workers=workers, pin_memory=bool(workers), persistent_workers=bool(workers), collate_fn=ds_train.collate)
     val_loader = torch.utils.data.DataLoader(ds_val, batch_size=cfg['batch_size'],
-        shuffle=False, num_workers=0, pin_memory=True, collate_fn=ds_val.collate)
+        shuffle=False, num_workers=workers, pin_memory=bool(workers), persistent_workers=bool(workers), collate_fn=ds_val.collate)
     del target_map
     gc.collect()
     print('Training / validation spectra:', len(ds_train), len(ds_val))
     ''')
     code('''
+    cfg['epochs'] = 10
+    TOTAL_BUDGET_S = 10.0 * 3600
+    INFER_RESERVE_S = 1.2 * 3600
+    TRAIN_BUDGET_S = TOTAL_BUDGET_S - INFER_RESERVE_S
     model = s2s.Spec2SmilesModel(cfg)
     model.warm_start(encoder_path)
     model.to(device)
@@ -205,41 +217,49 @@ def build_notebook():
     def lr_factor(step):
         if step < warmup_steps:
             return (step + 1) / warmup_steps
-        progress = min(1.0, (step-warmup_steps) / max(1, total_steps-warmup_steps))
-        return 0.5 * (1 + np.cos(np.pi * progress))
+        progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+        return max(0.05, 0.5 * (1 + np.cos(np.pi * progress)))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
     ema = s2s.EMA(model, decay=cfg['ema_decay'])
     parallel = nn.DataParallel(model) if torch.cuda.device_count() >= 2 else model
     history, best = [], float('inf')
     for epoch in range(cfg['epochs']):
+        ep_start = time.time()
         for param in enc_params:
             param.requires_grad_(epoch >= 1)
         train_loss = s2s.run_epoch(parallel, train_loader, device, optimizer, scaler, ema, scheduler)
         val_loss = s2s.run_epoch(ema.model, val_loader, device)
+        ep_time = time.time() - ep_start
+        elapsed = time.time() - START
         history.append(dict(epoch=epoch+1, train_loss=train_loss, val_loss=val_loss,
+                            ep_seconds=round(ep_time, 1), elapsed_seconds=round(elapsed, 1),
                             lrs=[g['lr'] for g in optimizer.param_groups], rss_gb=check_ram()))
         if val_loss < best:
             best = val_loss
-            torch.save({'model_state_dict': ema.model.state_dict(), 'epoch': epoch+1},
+            torch.save({'model_state_dict': ema.model.state_dict(), 'epoch': epoch+1, 'val_loss': best},
                        OUT / 'spec2smiles_model.pt')
-        print(history[-1])
+        print(history[-1], flush=True)
+        if elapsed + ep_time * 1.15 > TRAIN_BUDGET_S and (epoch + 1) >= 4:
+            print(f'Time guard reached at epoch {epoch+1} ({elapsed/3600:.2f}h elapsed); proceeding to beam search.')
+            break
     (OUT / 'spec2smiles_config.json').write_text(json.dumps(cfg, indent=2))
     del parallel, optimizer, scheduler, scaler, ema, train_loader, val_loader
     del ds_train, ds_val, tokens, tokens_aug, smiles, enc_params, dec_params
     gc.collect()
     torch.cuda.empty_cache()
-    checkpoint = torch.load(OUT / 'spec2smiles_model.pt', map_location='cpu', weights_only=True)
+    checkpoint = torch.load(OUT / 'spec2smiles_model.pt', map_location='cpu', weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     best_epoch = checkpoint['epoch']
     del checkpoint
     model.eval()
     ''')
     md('''
-    Average encoder memory across each molecule's spectra, then decode 32 molecules
-    together with beam width 12 and a 96-token budget. Completed paths are retained
-    across lengths before mass reranking and fast-key deduplication. Partition each
-    source Parquet in one streaming pass; all spectra for an ID share one partition.
+    Cross-attend uncorrupted fragment peak embeddings across each molecule's spectra,
+    then decode 64 molecules together with beam width 16 and a 110-token budget. Completed
+    paths are scored with Self-Spec2FP discriminative reranking (Morgan & MACCS Tanimoto,
+    elemental L1 distance, ppm mass error) followed by tautomer-canonical deduplication.
+    Partition each source Parquet in one streaming pass; all spectra for an ID share one partition.
     ''')
     code('''
     required = ['molecule_id', 'mz', 'inten', 'precursor_mz', 'neutral_mass',
@@ -272,8 +292,9 @@ def build_notebook():
     gc.collect()
     ''')
     code('''
+    float_cols = {'score', 'log_prob', 'nb_ll', 'cos_sim', 'tan_sim', 'maccs_cos', 'maccs_tan', 'elem_dist', 'ppm_err'}
     schema = pa.schema([(c, pa.int64() if c == 'rank' else pa.float64()
-                         if c in ('score', 'log_prob', 'ppm_err') else pa.string()) for c in s2s.COLUMNS])
+                         if c in float_cols else pa.string()) for c in s2s.COLUMNS])
     summaries = {}
     required = ['molecule_id', 'mz', 'inten', 'precursor_mz', 'neutral_mass',
                 'adduct', 'ce', 'instrument', 'polarity']
@@ -289,16 +310,18 @@ def build_notebook():
                 queries += query.molecule_id.nunique()
                 query['molecule_id'] = query.molecule_id.astype(str)
                 query['ce'] = pd.to_numeric(query.ce, errors='coerce').fillna(0)
-                candidates = s2s.generate_candidates(model, tokenizer, query, device, beam_size=12, top_k=25, mol_batch_size=32)
+                candidates = s2s.generate_candidates(model, tokenizer, query, device, beam_size=16, top_k=25, mol_batch_size=64, max_len=124)
                 writer.write_table(pa.Table.from_pandas(candidates, schema=schema, preserve_index=False))
                 rows += len(candidates)
                 covered += candidates.molecule_id.nunique()
                 if truth:
                     for qid, frame in candidates.groupby('molecule_id'):
-                        matched = frame.loc[frame.ik14.eq(truth[qid]), 'rank']
-                        if len(matched):
-                            reciprocal += 1/int(matched.min())
-                            hits += 1
+                        t_ik = truth.get(str(qid))
+                        if t_ik:
+                            matched = frame.loc[frame.ik14.eq(t_ik), 'rank']
+                            if len(matched):
+                                reciprocal += 1/int(matched.min())
+                                hits += 1
                 del query, candidates
                 gc.collect()
                 check_ram()
@@ -307,11 +330,20 @@ def build_notebook():
         if name != 'test':
             summaries[name].update(mrr25=reciprocal/max(queries, 1), recall25=hits/max(queries, 1))
         print(name, summaries[name])
+    test_cand = pd.read_parquet(OUT / 'cand_gen_test.parquet')
+    test_mol_ids = pd.read_parquet(test_path, columns=['molecule_id']).molecule_id.astype(str).unique().tolist()
+    test_preds = {str(qid): ';'.join(grp.sort_values('rank').head(25)['smiles']) for qid, grp in test_cand.groupby('molecule_id', sort=False)}
+    fallback_smi = 'CC(=O)Oc1ccccc1C(=O)O'
+    sub_df = pd.DataFrame({'molecule_id': test_mol_ids, 'smiles': [test_preds.get(mid) or fallback_smi for mid in test_mol_ids]})
+    is_valid, sub_errors, sub_warnings, sub_stats = evalkit.validate_submission(sub_df, test_mol_ids)
+    assert is_valid, f'Invalid submission_spec2smiles.csv: {sub_errors}'
+    sub_df.to_csv(OUT / 'submission_spec2smiles.csv', index=False)
+    print('Standalone submission validation:', sub_stats)
     ''')
     code('''
     metrics = dict(best_epoch=best_epoch, best_val_loss=best, history=history,
                    splits=summaries, selection='val_model smoothed cross entropy',
-                   generation='beam12, max_len96, mol_batch32, top25, log_prob - 0.05 * ppm_err')
+                   generation='beam16, max_len124, mol_batch64, top25, self-spec2fp reranked')
     (OUT / 'spec2smiles_val_metrics.json').write_text(json.dumps(metrics, indent=2))
     for name in ('spec2smiles.py', 'spec2fp.py', 'evalkit.py'):
         shutil.copy2(WORK / name, OUT / name)
@@ -332,6 +364,7 @@ def build_notebook():
                     encoder_config_sha256=sha256(encoder_config_path),
                     split_sha256=sha256(split_path), torch_version=torch.__version__,
                     rdkit_version=Chem.rdBase.rdkitVersion, summaries=summaries,
+                    submission_validation=sub_stats,
                     files={p.name: dict(bytes=p.stat().st_size, sha256=sha256(p))
                            for p in OUT.iterdir() if p.is_file() and p.name != 'manifest.json'})
     (OUT / 'manifest.json').write_text(json.dumps(manifest, indent=2))

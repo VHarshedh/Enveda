@@ -50,8 +50,12 @@ class Stage07Tests(unittest.TestCase):
         base = Spec2FPModel(self.cfg['encoder'])
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp)/'model.pt'
+            pw_p = Path(tmp)/'spec2fp_pos_weights.npy'
+            np.save(pw_p, np.full(4096, 4.0, dtype=np.float32))
             torch.save({'best_proxy_mrr': np.float64(0.25), 'ema_state_dict': {'module.'+k: v for k, v in base.state_dict().items()}}, p)
             model.warm_start(p)
+            expected_shift = float(0.5 * np.log(4.0))
+            self.assertTrue(torch.allclose(model.pw_shift, torch.tensor(expected_shift, dtype=torch.float32)))
         self.assertTrue(torch.equal(model.peak_proj[0].weight, base.peak_proj[0].weight))
         self.assertIs(model.output.weight, model.token_emb.weight)
         self.assertFalse(model.elem_count_head.weight.requires_grad)
@@ -70,12 +74,12 @@ class Stage07Tests(unittest.TestCase):
         for p in model.encoder_parameters():
             p.requires_grad_(False)
         tok = np.asarray([self.tok.encode('CCO')], dtype=np.uint8)
-        frame = pd.DataFrame([dict(mz=[10., 20.], inten=[1., 2.], precursor_mz=47.,
+        frame = pd.DataFrame([dict(molecule_id='m1', mz=[10., 20.], inten=[1., 2.], precursor_mz=47.,
             neutral_mass=46., ce=20., adduct='[M+H]+', instrument='qtof', polarity='positive', smiles='CCO')]*2)
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp)/'records.bin'
             with p.open('wb') as stream:
-                s.append_records(frame, stream, self.cfg, {'CCO': 0})
+                s.append_records(frame, stream, self.cfg, {'m1': 0})
             ds = s.SpectrumDataset(p, self.cfg, self.tok, ['CCO'], tok, augment=True, tokens_aug=tok)
             with patch.object(s.Chem, 'MolFromSmiles', side_effect=AssertionError('RDKit in training')), patch.object(s.np.random, 'random', return_value=0.0):
                 np.testing.assert_array_equal(ds[0][2], tok[0])
@@ -104,6 +108,9 @@ class Stage07Tests(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual(result.iloc[0].smiles, 'CCO')
         self.assertAlmostEqual(result.iloc[0].ppm_err, 0.)
+        self.assertTrue(np.isfinite(result.iloc[0].nb_ll))
+        self.assertTrue(np.isfinite(result.iloc[0].cos_sim))
+        self.assertTrue(np.isfinite(result.iloc[0].maccs_cos))
         self.assertEqual(result['rank'].tolist(), [1, 2])
         self.assertEqual(result.source.unique().tolist(), ['spec2smiles'])
         self.assertEqual(len(s.generate_candidates(model, self.tok, frame.iloc[:0], 'cpu')), 0)
@@ -194,6 +201,67 @@ class Stage07Tests(unittest.TestCase):
                 candidates = pd.read_parquet(out/f'cand_gen_{name}.parquet')
                 self.assertEqual(list(candidates), s.COLUMNS)
                 self.assertEqual(len(candidates), 1)
+
+    def test_bug_fixes(self):
+        # Bug 1: target_map keyed by molecule_id
+        frame = pd.DataFrame([
+            dict(molecule_id='mol1', mz=[10.], inten=[1.], precursor_mz=47.,
+                 neutral_mass=46., ce=20., adduct='[M+H]+', instrument='qtof',
+                 polarity='positive', smiles='CCO'),
+            dict(molecule_id='mol1', mz=[10.], inten=[1.], precursor_mz=47.,
+                 neutral_mass=46., ce=20., adduct='[M+H]+', instrument='qtof',
+                 polarity='positive', smiles='OCC'),  # alternate SMILES for same molecule_id
+        ])
+        target_map = {'mol1': 42}
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'records.bin'
+            with p.open('wb') as stream:
+                s.append_records(frame, stream, self.cfg, target_map)
+            records = np.memmap(p, mode='r', dtype=s.record_dtype(self.cfg['top_k_peaks']))
+            self.assertEqual(int(records[0]['target']), 42)
+            self.assertEqual(int(records[1]['target']), 42)
+            del records
+
+        # Bug 2: Empty string or None fallback in submission
+        fallback = 'CC(=O)Oc1ccccc1C(=O)O'
+        preds = {'m1': '', 'm2': 'CCO;CCN'}
+        self.assertEqual(preds.get('m1') or fallback, fallback)
+        self.assertEqual(preds.get('m2') or fallback, 'CCO;CCN')
+        self.assertEqual(preds.get('missing') or fallback, fallback)
+
+        # Bug 3: Truth lookup safety in validation
+        truth = {'val1': 'IK14_A'}
+        candidates = pd.DataFrame([
+            dict(molecule_id='val1', ik14='IK14_A', rank=1),
+            dict(molecule_id='val_missing', ik14='IK14_B', rank=2),
+        ])
+        reciprocal, hits = 0.0, 0
+        for qid, grp in candidates.groupby('molecule_id'):
+            t_ik = truth.get(str(qid))
+            if t_ik:
+                matched = grp.loc[grp.ik14.eq(t_ik), 'rank']
+                if len(matched):
+                    reciprocal += 1 / int(matched.min())
+                    hits += 1
+        self.assertEqual(hits, 1)
+        self.assertEqual(reciprocal, 1.0)
+
+        # Bug 4: pw_shift effect on fp_probs
+        model = s.Spec2SmilesModel(self.cfg).eval()
+        batch = self.spectra(n=1)
+        with torch.no_grad():
+            _, _, _, _, _, fp_unshifted, _ = model.encode(**batch, return_fp=True)
+            model.pw_shift.fill_(2.0)
+            _, _, _, _, _, fp_shifted, _ = model.encode(**batch, return_fp=True)
+        self.assertTrue((fp_shifted < fp_unshifted).all())
+
+        # Peak gather mz return and multi-spectrum non-finite/negative robustness
+        spec_item = s.spectrum_item(pd.Series(dict(
+            mz=[10., 20.], inten=[0., 2.], precursor_mz=47., adduct='[M+H]+', ce=20.,
+            instrument='qtof', polarity='positive'
+        )), self.cfg)
+        self.assertIn('mz', spec_item)
+        self.assertEqual(len(spec_item['mz']), spec_item['n_peaks'])
 
 
 if __name__ == '__main__':

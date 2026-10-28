@@ -87,7 +87,7 @@ def tensorize_spectrum(
     pol_idx = int(polarity) if isinstance(polarity, (int, np.integer)) else POLARITY2IDX.get(str(polarity).strip().lower(), POLARITY2IDX["<unk>"])
     ce_val = float(ce) if not (ce is None or (isinstance(ce, float) and math.isnan(ce))) else 0.0
     return {
-        "peak_feat": peak_feat, "n_peaks": n,
+        "peak_feat": peak_feat, "n_peaks": n, "mz": mz,
         "adduct_idx": adduct_idx, "inst_idx": inst_idx, "pol_idx": pol_idx,
         "ce_val": np.float32(ce_val), "prec_mz": np.float32(precursor_mz),
     }
