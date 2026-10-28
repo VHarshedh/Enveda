@@ -136,3 +136,4 @@ Compiled notebooks are written to `notebooks/<stage>.ipynb`.
 - **Evaluation Metric**: MRR@25 on `molecule_id`. Tautomer-canonicalized InChIKey14 deduplication prevents wasting submission slots.
 - **Leakage Prevention**: Never read `val_rank` labels during model or hyperparameter tuning. Reranker models are strictly evaluated on identical upstream fold models.
 - **Kaggle Environment**: Dual NVIDIA T4 GPUs (15 GB each), internet disabled, <= 9 hours total runtime. Self-contained notebooks embed required source modules via `%%writefile /kaggle/working/<module>.py`.
+
